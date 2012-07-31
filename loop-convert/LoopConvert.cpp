@@ -42,9 +42,10 @@ int main(int argc, const char **argv) {
   }
 
   RefactoringTool LoopTool(*Compilations, SourcePaths);
-  LoopPrinter Printer;
+  Replacements &Replace = LoopTool.getReplacements();
+  LoopFixer Fixer(Replace);
   MatchFinder Finder;
-  Finder.addMatcher(LoopMatcher, &Printer);
+  Finder.addMatcher(LoopMatcher, &Fixer);
   if (int result = LoopTool.run(newFrontendActionFactory(&Finder))) {
     llvm::errs() << "Error encountered during translation.\n";
     return result;

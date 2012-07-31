@@ -7,8 +7,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file contains matchers and callbacks for use in migrating C++ for loops.
-//
+// This file declares matchers and callbacks for use in migrating C++ for loops.
 //
 //===----------------------------------------------------------------------===//
 #ifndef _LLVM_TOOLS_CLANG_TOOLS_LOOP_CONVERT_LOOPACTIONS_H_
@@ -16,6 +15,7 @@
 
 #include "clang/Tooling/Refactoring.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/ASTMatchers/ASTMatchFinder.h"
 
 namespace clang {
@@ -23,8 +23,12 @@ namespace loop_migrate {
 using clang::ast_matchers::MatchFinder;
 using clang::ast_matchers::StatementMatcher;
 
-class LoopPrinter : public MatchFinder::MatchCallback {
+class LoopFixer : public MatchFinder::MatchCallback {
+ private:
+  tooling::Replacements &Replace;
+
  public:
+  explicit LoopFixer(tooling::Replacements &Replace) : Replace(Replace) { }
   virtual void run(const MatchFinder::MatchResult &Result);
 };
 
