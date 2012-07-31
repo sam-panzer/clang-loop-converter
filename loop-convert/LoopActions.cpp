@@ -11,9 +11,13 @@ void LoopPrinter::run(const MatchFinder::MatchResult &Result) {
 }
 
 StatementMatcher LoopMatcher =
-  id("forLoop",
-     forStmt(hasLoopInit(declarationStatement(hasSingleDecl(variable(
-         hasInitializer(integerLiteral(equals(0)))))))));
+  id("forLoop", forStmt(
+      hasLoopInit(declarationStatement(hasSingleDecl(variable(
+          hasInitializer(integerLiteral(equals(0))))))),
+      hasIncrement(unaryOperator(
+          hasOperatorName("++"),
+          hasUnaryOperand(declarationReference(to(
+              variable(hasType(isInteger())).bind("incrementVariable"))))))));
 
 } // namespace loop_migrate
 } // namespace clang
