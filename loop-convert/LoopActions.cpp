@@ -14,6 +14,12 @@ StatementMatcher LoopMatcher =
   id("forLoop", forStmt(
       hasLoopInit(declarationStatement(hasSingleDecl(variable(
           hasInitializer(integerLiteral(equals(0))))))),
+      hasCondition(binaryOperator(hasOperatorName("<"),
+                                  hasRHS(declarationReference(to(
+                                      variable(hasType(isInteger()))
+                                      .bind("conditionVariable")))),
+                                  hasLHS(expression(hasType(isInteger()))
+                                         .bind("conditionBound")))),
       hasIncrement(unaryOperator(
           hasOperatorName("++"),
           hasUnaryOperand(declarationReference(to(
