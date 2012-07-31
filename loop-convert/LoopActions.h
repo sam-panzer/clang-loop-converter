@@ -15,6 +15,7 @@
 #define _LLVM_TOOLS_CLANG_TOOLS_LOOP_CONVERT_LOOPACTIONS_H_
 
 #include "clang/Tooling/Refactoring.h"
+#include "clang/AST/ASTContext.h"
 #include "clang/ASTMatchers/ASTMatchFinder.h"
 
 namespace clang {

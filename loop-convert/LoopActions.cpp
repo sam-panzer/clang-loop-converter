@@ -11,9 +11,31 @@ const char ConditionVarName[] = "conditionVar";
 const char IncrementVarName[] = "incrementVar";
 const char InitVarName[] = "initVar";
 
+// Returns true when two ValueDecls are the same variable.
+static bool areSameVariable(const ValueDecl *First, const ValueDecl *Second) {
+  return First && Second &&
+         First->getCanonicalDecl() == Second->getCanonicalDecl();
+}
+
 void LoopPrinter::run(const MatchFinder::MatchResult &Result) {
-  if (const ForStmt *FS = Result.Nodes.getStmtAs<ForStmt>("forLoop"))
-    FS->dump();
+  ASTContext *Context = Result.Context;
+  const ForStmt *FS = Result.Nodes.getStmtAs<ForStmt>(LoopName);
+
+  if (!Context->getSourceManager().isFromMainFile(FS->getForLoc()))
+    return;
+
+  const VarDecl *LoopVar = Result.Nodes.getDeclAs<VarDecl>(IncrementVarName);
+  const VarDecl *CondVar = Result.Nodes.getDeclAs<VarDecl>(ConditionVarName);
+  const VarDecl *InitVar = Result.Nodes.getDeclAs<VarDecl>(InitVarName);
+
+  if (!areSameVariable(LoopVar, CondVar) || !areSameVariable(LoopVar, InitVar))
+    return;
+  const Expr *BoundExpr= Result.Nodes.getStmtAs<Expr>(ConditionBoundName);
+
+  llvm::outs() << "Discovered potentially translatable loop: variable is "
+               << LoopVar->getNameAsString() << ".\n Bound expression is: ";
+  BoundExpr->dump();
+  llvm::outs() << "\n";
 }
 
 static StatementMatcher ArrayLHSMatcher =
