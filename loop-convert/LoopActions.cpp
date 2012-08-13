@@ -13,27 +13,18 @@ const char IncrementVarName[] = "incrementVar";
 const char InitVarName[] = "initVar";
 
 typedef llvm::SmallPtrSet<const Expr *, 1> ContainerResult;
+typedef const Expr* Usage;
+typedef llvm::SmallVector<Usage, 8> UsageResult;
+using tooling::Replacement;
+using tooling::Replacements;
 
+/// ForLoopASTVisitor - discover usages of expressions indexing into containers.
+///
+/// Given an index variable, recursively crawls a for loop to discover if the
+/// index variable is used in a way consistent with range-based for loop access.
 class ForLoopASTVisitor : public RecursiveASTVisitor<ForLoopASTVisitor> {
- public :
-  // Typedefs for returned values.
-  typedef const Expr* Usage;
-  typedef llvm::SmallVector<Usage, 8> UsageResult;
-  // Typedef used in CRTP functions.
-  typedef RecursiveASTVisitor<ForLoopASTVisitor> VisitorBase;
-
- private:
-  bool OnlyUsedAsIndex;
-  ASTContext *Context;
-  // A container which holds all allowed usages of TargetVar.
-  UsageResult Usages;
-  // A set which holds expressions containing the referenced arrays.
-  ContainerResult ContainersIndexed;
-  // The index variable's VarDecl.
-  const VarDecl *TargetVar;
-
  public:
-  explicit ForLoopASTVisitor(ASTContext *Context, const VarDecl *TargetVar) :
+  ForLoopASTVisitor(ASTContext *Context, const VarDecl *TargetVar) :
     OnlyUsedAsIndex(true), Context(Context), TargetVar(TargetVar) { }
 
   // Accessor for Usages
@@ -47,20 +38,36 @@ class ForLoopASTVisitor : public RecursiveASTVisitor<ForLoopASTVisitor> {
   // Finds all uses of TargetVar in Body, placing all usages in Usages, all
   // referenced arrays in ContainersIndexed, and returns true if TargetVar was
   // only used as an array index.
+  //
+  // The general strategy is to reject any DeclRefExprs referencing TargetVar,
+  // with the exception of certain acceptable patterns.
+  // For arrays, the DeclRefExpr for TargetVar must appear as the index of an
+  // ArraySubscriptExpression.
   bool findUsages(const Stmt *Body) {
     TraverseStmt(const_cast<Stmt *>(Body));
     return OnlyUsedAsIndex;
   }
 
+ private:
+  bool OnlyUsedAsIndex;
+  ASTContext *Context;
+  // A container which holds all allowed usages of TargetVar.
+  UsageResult Usages;
+  // A set which holds expressions containing the referenced arrays.
+  ContainerResult ContainersIndexed;
+  // The index variable's VarDecl.
+  const VarDecl *TargetVar;
+
+  // Typedef used in CRTP functions.
+  typedef RecursiveASTVisitor<ForLoopASTVisitor> VisitorBase;
+  friend class RecursiveASTVisitor<ForLoopASTVisitor>;
   // Overriden methods for RecursiveASTVisitor's traversal
   bool TraverseArraySubscriptExpr(ArraySubscriptExpr *ASE);
   bool VisitDeclRefExpr(DeclRefExpr *DRE);
 };
 
-typedef ForLoopASTVisitor::UsageResult UsageResult;
-using tooling::Replacement;
-using tooling::Replacements;
-
+// Obtain the original source code text from a SourceRange.
+// FIXME: Maybe put this somewhere more generally accessible?
 static StringRef getStringFromRange(SourceManager &SourceMgr,
                                     const LangOptions &LangOpts,
                                     SourceRange Range) {
@@ -120,30 +127,20 @@ static bool arrayMatchesConditionExpr(ASTContext *Context,
                                       const QualType &ArrayType,
                                       const Expr *ConditionExpr) {
   const Type *T = ArrayType.getCanonicalType().getTypePtr();
-  if (const ConstantArrayType *CAT = dyn_cast<ConstantArrayType>(T)) { // meow
-    // The array's size will always be an APInt representing the length as an
-    // unsigned value, and ConditionExpr may evaluate to a signed value.
-    // To avoid precision loss, we extend each to be one bit larger than the
-    // largest size, convert ConditionExpr to an unsigned value, and compare
-    // the two unsigned values.
+  if (const ConstantArrayType *CAT = dyn_cast<ConstantArrayType>(T)) {
     llvm::APSInt ConditionSize;
     if (!ConditionExpr->isIntegerConstantExpr(ConditionSize, *Context))
       return false;
-    uint32_t Width = ConditionSize.getBitWidth();
     llvm::APSInt ArraySize(CAT->getSize());
-    uint32_t ArrayWidth = ArraySize.getBitWidth();
-    if (Width < ArrayWidth)
-      Width = ArrayWidth;
-    llvm::APSInt ExtendedCondition = ConditionSize.extend(Width + 1);
-    ExtendedCondition.setIsUnsigned(true);
-    return ArraySize.extend(Width + 1) == ExtendedCondition;
+    return llvm::APSInt::isSameValue(ConditionSize, ArraySize);
   }
   return false;
 }
 
-//////////////////// ForLoopASTVisitor functions
 // If we encounter an array with TargetVar as the index, note it and prune the
-// AST traversal. Otherwise, continue the traversal recursively.
+// AST traversal so that VisitDeclRefExpr() doesn't discover the reference to
+// the index and mark it as unconvertible.
+// Otherwise, continue the traversal recursively.
 bool ForLoopASTVisitor::TraverseArraySubscriptExpr(ArraySubscriptExpr *ASE) {
   Expr *Arr = ASE->getBase();
   if (isValidSubscriptExpr(ASE->getIdx(), TargetVar, Arr)) {
