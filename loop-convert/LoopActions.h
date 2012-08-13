@@ -13,6 +13,7 @@
 #ifndef _LLVM_TOOLS_CLANG_TOOLS_LOOP_CONVERT_LOOPACTIONS_H_
 #define _LLVM_TOOLS_CLANG_TOOLS_LOOP_CONVERT_LOOPACTIONS_H_
 
+#include "StmtAncestor.h"
 #include "clang/Tooling/Refactoring.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
@@ -20,19 +21,58 @@
 
 namespace clang {
 namespace loop_migrate {
+
 using clang::ast_matchers::MatchFinder;
 using clang::ast_matchers::StatementMatcher;
+using llvm::FoldingSetNodeID;
 
+/// \brief The level of safety to require of transformations.
+enum TranslationConfidenceKind {
+  TCK_Risky,
+  TCK_Extra,
+  TCK_Safe
+};
+
+enum LoopFixerKind {
+  LFK_Array,
+  LFK_Iterator,
+  LFK_PseudoArray
+};
+
+/// \brief Argument pack for LoopFixer.
+///
+/// Contains long-lived data structures that should be preserved across matcher
+/// callback runs.
+struct LoopFixerArgs {
+  tooling::Replacements *Replace;
+  DeclMap *GeneratedDecls;
+  ReplacedVarsMap *ReplacedVarRanges;
+  unsigned AcceptedChanges;
+  unsigned DeferredChanges;
+  unsigned RejectedChanges;
+  bool CountOnly;
+  bool PreferAuto;
+  bool InsertConst;
+  TranslationConfidenceKind ConfidenceLevel;
+};
+
+/// LoopFixer: The callback to be used for loop migration matchers.
+///
+/// The callback does extra checking not possible in matchers, and attempts to
+/// convert the for loop, if possible.
 class LoopFixer : public MatchFinder::MatchCallback {
  private:
-  tooling::Replacements &Replace;
+  StmtAncestorASTVisitor *ParentFinder;
+  LoopFixerArgs *Args;
+  LoopFixerKind FixerKind;
 
  public:
-  explicit LoopFixer(tooling::Replacements &Replace) : Replace(Replace) { }
+  LoopFixer(LoopFixerArgs *Args, StmtAncestorASTVisitor *ParentFinder,
+            LoopFixerKind FixerKind) :
+    ParentFinder(ParentFinder), Args(Args), FixerKind(FixerKind) { }
   virtual void run(const MatchFinder::MatchResult &Result);
 };
 
-extern StatementMatcher LoopMatcher;
 
 } // namespace loop_migrate
 } // namespace clang
