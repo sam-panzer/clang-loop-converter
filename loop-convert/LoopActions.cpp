@@ -1,4 +1,6 @@
 #include "LoopActions.h"
+#include "VariableNaming.h"
+
 #include "clang/Lex/Lexer.h"
 
 namespace clang {
@@ -6,6 +8,7 @@ namespace loop_migrate {
 
 using namespace clang::ast_matchers;
 
+// Constants used for matcher name bindings
 const char LoopName[] = "forLoop";
 const char ConditionBoundName[] = "conditionBound";
 const char ConditionVarName[] = "conditionVar";
@@ -29,10 +32,10 @@ class ForLoopIndexUseVisitor
   ForLoopIndexUseVisitor(ASTContext *Context, const VarDecl *IndexVar) :
     OnlyUsedAsIndex(true), Context(Context), IndexVar(IndexVar) { }
 
-  // Accessor for Usages
+  /// Accessor for Usages.
   const UsageResult &getUsages() const { return Usages; }
 
-  // Accessor for ContainersIndexed
+  /// Accessor for ContainersIndexed.
   const ContainerResult &getContainersIndexed() const {
     return ContainersIndexed;
   }
@@ -56,7 +59,7 @@ class ForLoopIndexUseVisitor
   // A container which holds all usages of IndexVar as the index of
   // ArraySubscriptExpressions.
   UsageResult Usages;
-  // A set which holds expressions containing the referenced arrays.
+  /// A set which holds expressions containing the referenced arrays.
   ContainerResult ContainersIndexed;
   // The index variable's VarDecl.
   const VarDecl *IndexVar;
@@ -87,6 +90,14 @@ static const DeclRefExpr *getDeclRef(const Expr *E) {
   return dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts());
 }
 
+// If the given expression is actually a DeclRefExpr, find and return the
+// underlying VarDecl; otherwise, return NULL.
+static const VarDecl *getReferencedVariable(const Expr *E) {
+  if (const DeclRefExpr *DRE = getDeclRef(E))
+    return dyn_cast<VarDecl>(DRE->getDecl());
+  return NULL;
+}
+
 // Returns true when two ValueDecls are the same variable.
 static bool areSameVariable(const ValueDecl *First, const ValueDecl *Second) {
   return First && Second &&
@@ -98,6 +109,7 @@ static bool areSameExpr(ASTContext* Context, const Expr *First,
                         const Expr *Second) {
   if (!First || !Second)
     return false;
+
   llvm::FoldingSetNodeID FirstID, SecondID;
   First->Profile(FirstID, *Context, true);
   Second->Profile(SecondID, *Context, true);
@@ -126,9 +138,9 @@ static bool isIndexInSubscriptExpr(const Expr *IndexExpr,
 
 // Determines whether the bound of a for loop condition expression is the same
 // as the statically computable size of ArrayType.
-static bool arrayMatchesConditionExpr(ASTContext *Context,
-                                      const QualType &ArrayType,
-                                      const Expr *ConditionExpr) {
+static bool arrayMatchesBoundExpr(ASTContext *Context,
+                                  const QualType &ArrayType,
+                                  const Expr *ConditionExpr) {
   const Type *T = ArrayType.getCanonicalType().getTypePtr();
   if (const ConstantArrayType *CAT = dyn_cast<ConstantArrayType>(T)) {
     llvm::APSInt ConditionSize;
@@ -144,7 +156,8 @@ static bool arrayMatchesConditionExpr(ASTContext *Context,
 // AST traversal so that VisitDeclRefExpr() doesn't discover the reference to
 // the index and mark it as unconvertible.
 // Otherwise, continue the traversal recursively.
-bool ForLoopIndexUseVisitor::TraverseArraySubscriptExpr(ArraySubscriptExpr *ASE) {
+bool ForLoopIndexUseVisitor::TraverseArraySubscriptExpr(
+    ArraySubscriptExpr *ASE) {
   Expr *Arr = ASE->getBase();
   if (isIndexInSubscriptExpr(ASE->getIdx(), IndexVar, Arr)) {
     const Expr *ArrReduced = Arr->IgnoreParenCasts();
@@ -153,7 +166,7 @@ bool ForLoopIndexUseVisitor::TraverseArraySubscriptExpr(ArraySubscriptExpr *ASE)
     Usages.push_back(ASE);
     return true;
   }
-  return VisitorBase::TraverseStmt(ASE);
+  return VisitorBase::TraverseArraySubscriptExpr(ASE);
 }
 
 // If we encounter a reference to IndexVar in an unpruned branch of the
@@ -166,22 +179,30 @@ bool ForLoopIndexUseVisitor::VisitDeclRefExpr(DeclRefExpr *DRE) {
 }
 
 // Apply the source transformations necessary to migrate the loop!
-static void doConversion(ASTContext *Context, Replacements &Replace,
+static void doConversion(ASTContext *Context, LoopFixerArgs *Args,
+                         const StmtParentMap *ParentMap,
                          const VarDecl *IndexVar, const Expr *ContainerExpr,
                          const UsageResult &Usages, const ForStmt *TheLoop) {
-  std::string VarName = "elem";
+  const VarDecl *MaybeContainer = getReferencedVariable(ContainerExpr);
+  VariableNamer Namer(Context, Args->GeneratedDecls, ParentMap,
+                      IndexVar->getDeclContext(), TheLoop, IndexVar,
+                      MaybeContainer);
+  std::string VarName = Namer.createIndexName();
+
   // First, replace all usages of the array subscript expression with our new
   // variable.
   for (UsageResult::const_iterator I = Usages.begin(), E = Usages.end();
        I != E; ++I) {
     SourceRange ReplaceRange = (*I)->getSourceRange();
     std::string ReplaceText = VarName;
-    Replace.insert(Replacement(Context->getSourceManager(),
-                               CharSourceRange::getTokenRange(ReplaceRange),
-                               ReplaceText));
+    Args->ReplacedVarRanges->insert(std::make_pair(TheLoop, IndexVar));
+    Args->Replace->insert(
+        Replacement(Context->getSourceManager(),
+                    CharSourceRange::getTokenRange(ReplaceRange),
+                    ReplaceText));
   }
 
-  // Now, we need to reconstruct the new range expresion.
+  // Now, we need to construct the new range expresion.
   SourceRange ParenRange(TheLoop->getLParenLoc(), TheLoop->getRParenLoc());
   StringRef ContainerString =
       getStringFromRange(Context->getSourceManager(), Context->getLangOpts(),
@@ -193,9 +214,10 @@ static void doConversion(ASTContext *Context, Replacements &Replace,
 
   std::string Range = ("(" + TypeString + " " + VarName + " : "
                            + ContainerString + ")").str();
-  Replace.insert(Replacement(Context->getSourceManager(),
-                             CharSourceRange::getTokenRange(ParenRange),
-                             Range));
+  Args->Replace->insert(Replacement(Context->getSourceManager(),
+                                   CharSourceRange::getTokenRange(ParenRange),
+                                   Range));
+  Args->GeneratedDecls->insert(make_pair(TheLoop, VarName));
 }
 
 // The LoopFixer callback, which determines if loops discovered by the
@@ -219,17 +241,35 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
   if (!Finder.findUsages(FS->getBody()))
     return;
 
+  // If we already modified the range of this for loop, don't do any further
+  // updates on this iteration.
+  // FIXME: Once Replacements can detect conflicting edits, replace this
+  // implementation and rely on conflicting edit detection instead.
+  if (Args->ReplacedVarRanges->count(FS))
+    return;
+
   // We require that a single array be indexed into by LoopVar.
   const ContainerResult &ContainersIndexed = Finder.getContainersIndexed();
   if (ContainersIndexed.size() != 1)
     return;
 
   const Expr *ContainerExpr = *(ContainersIndexed.begin());
-  if (!arrayMatchesConditionExpr(Context, ContainerExpr->getType(), BoundExpr))
+  if (!arrayMatchesBoundExpr(Context, ContainerExpr->getType(), BoundExpr))
+    return;
+  ParentFinder->gatherAncestors(Context->getTranslationUnitDecl(),
+                                /*RunEvenIfNotEmpty=*/false);
+
+  // Ensure that we do not try to move an expression dependent on a local
+  // variable declared inside the loop outside of it!
+  DependencyFinderASTVisitor
+      DependencyFinder(&ParentFinder->getStmtToParentStmtMap(),
+                       &ParentFinder->getDeclToParentStmtMap(),
+                       Args->ReplacedVarRanges, FS);
+  if (DependencyFinder.dependsOnOutsideVariable(ContainerExpr))
     return;
 
-  doConversion(Context, Replace, LoopVar, ContainerExpr, Finder.getUsages(),
-               FS);
+  doConversion(Context, Args, &ParentFinder->getStmtToParentStmtMap(),
+               LoopVar, ContainerExpr, Finder.getUsages(), FS);
 }
 
 static StatementMatcher ArrayLHSMatcher =
@@ -240,8 +280,8 @@ static StatementMatcher ArrayRHSMatcher =
 
 StatementMatcher LoopMatcher =
   id(LoopName, forStmt(
-      hasLoopInit(declarationStatement(hasSingleDecl(variable(
-          hasInitializer(integerLiteral(equals(0)))).bind(InitVarName)))),
+      hasLoopInit(declarationStatement(hasSingleDecl(id(InitVarName, variable(
+          hasInitializer(ignoringImpCasts(integerLiteral(equals(0))))))))),
       hasCondition(binaryOperator(hasOperatorName("<"),
                                   hasLHS(ArrayLHSMatcher),
                                   hasRHS(ArrayRHSMatcher))),

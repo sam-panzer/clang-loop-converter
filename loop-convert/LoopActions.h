@@ -13,6 +13,7 @@
 #ifndef _LLVM_TOOLS_CLANG_TOOLS_LOOP_CONVERT_LOOPACTIONS_H_
 #define _LLVM_TOOLS_CLANG_TOOLS_LOOP_CONVERT_LOOPACTIONS_H_
 
+#include "StmtAncestor.h"
 #include "clang/Tooling/Refactoring.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
@@ -23,15 +24,33 @@ namespace loop_migrate {
 using clang::ast_matchers::MatchFinder;
 using clang::ast_matchers::StatementMatcher;
 
+/// \brief Argument pack for LoopFixer.
+///
+// Contains long-lived data structures that should be preserved across matcher
+/// callback runs.
+struct LoopFixerArgs {
+  tooling::Replacements *Replace;
+  StmtGeneratedVarNameMap *GeneratedDecls;
+  ReplacedVarsMap *ReplacedVarRanges;
+};
+
+/// LoopFixer: The callback to be used for loop migration matchers.
+///
+/// The callback does extra checking not possible in matchers, and attempts to
+/// convert the for loop, if possible.
+
 class LoopFixer : public MatchFinder::MatchCallback {
  private:
-  tooling::Replacements &Replace;
+  StmtAncestorASTVisitor *ParentFinder;
+  LoopFixerArgs *Args;
 
  public:
-  explicit LoopFixer(tooling::Replacements &Replace) : Replace(Replace) { }
+  LoopFixer(LoopFixerArgs *Args, StmtAncestorASTVisitor *ParentFinder) :
+  ParentFinder(ParentFinder), Args(Args) { }
   virtual void run(const MatchFinder::MatchResult &Result);
 };
 
+/// The matcher to use for convertible for loops.
 extern StatementMatcher LoopMatcher;
 
 } // namespace loop_migrate
