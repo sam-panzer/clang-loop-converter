@@ -42,8 +42,12 @@ int main(int argc, const char **argv) {
   }
 
   RefactoringTool LoopTool(*Compilations, SourcePaths);
-  Replacements &Replace = LoopTool.getReplacements();
-  LoopFixer Fixer(Replace);
+  StmtAncestorASTVisitor ParentFinder;
+  DeclMap GeneratedDecls;
+  ReplacedVarsMap ReplacedVars;
+  LoopFixerArgs FixerArgs = {&LoopTool.getReplacements(), &GeneratedDecls,
+                             &ReplacedVars};
+  LoopFixer Fixer(&FixerArgs, &ParentFinder);
   MatchFinder Finder;
   Finder.addMatcher(LoopMatcher, &Fixer);
   if (int result = LoopTool.run(newFrontendActionFactory(&Finder))) {
