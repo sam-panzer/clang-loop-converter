@@ -44,4 +44,15 @@ void f() {
   // CHECK: for (int j = 0; j < M; ++j)
   // CHECK-NEXT: for (auto & [[VAR:[a-zA-Z_]+]] : Nest)
   // CHECK-NEXT: printf("Got item %d", [[VAR]][j].x);
+  Nested<T> NestT;
+  for (Nested<T>::iterator I = NestT.begin(), E = NestT.end(); I != E; ++I) {
+    for (T::iterator TI = (*I).begin(), TE = (*I).end(); TI != TE; ++TI) {
+      printf("%d", *TI);
+    }
+  }
+  // The inner loop is also convertible, but doesn't need to be converted
+  // immediately. Update this test when that changes!
+  // CHECK: for (auto & [[VAR:[a-zA-Z_]+]] : NestT) {
+  // CHECK-NEXT: for (T::iterator TI = ([[VAR]]).begin(), TE = ([[VAR]]).end(); TI != TE; ++TI) {
+  // CHECK-NEXT: printf("%d", *TI);
 }

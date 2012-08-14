@@ -89,6 +89,11 @@ void multipleArrays() {
 
   for (int i = 0; i < N; ++i)
     sum += arr[i] + badArr[i];
+
+  for (int i = 0; i < N; ++i) {
+    int k = badArr[i];
+    sum += arr[i] + k;
+  }
 }
 
 struct HasArr {

@@ -31,6 +31,12 @@ enum TranslationConfidenceKind {
   TCK_Safe
 };
 
+enum LoopFixerKind {
+  LFK_Array,
+  LFK_Iterator,
+  LFK_PseudoArray
+};
+
 /// \brief Argument pack for LoopFixer.
 ///
 // Contains long-lived data structures that should be preserved across matcher
@@ -55,15 +61,14 @@ class LoopFixer : public MatchFinder::MatchCallback {
  private:
   StmtAncestorASTVisitor *ParentFinder;
   LoopFixerArgs *Args;
+  LoopFixerKind FixerKind;
 
  public:
-  LoopFixer(LoopFixerArgs *Args, StmtAncestorASTVisitor *ParentFinder) :
-  ParentFinder(ParentFinder), Args(Args) { }
+  LoopFixer(LoopFixerArgs *Args, StmtAncestorASTVisitor *ParentFinder,
+            LoopFixerKind FixerKind) :
+  ParentFinder(ParentFinder), Args(Args) , FixerKind(FixerKind)  { }
   virtual void run(const MatchFinder::MatchResult &Result);
 };
-
-/// The matcher to use for convertible for loops.
-extern StatementMatcher LoopMatcher;
 
 } // namespace loop_migrate
 } // namespace clang

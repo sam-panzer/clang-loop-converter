@@ -32,6 +32,17 @@ void aliasing() {
   // CHECK-NEXT: Val &t = [[VAR]];
   // CHECK-NEXT: int y = t.x;
   // CHECK-NEXT: int z = [[VAR]].x + t.x;
+
+  for (int i = 0; i < N; ++i) {
+    Val t = Arr[i];
+    int y = t.x;
+    int z = Arr[i].x + t.x;
+  }
+  // CHECK: for (auto & [[VAR:[a-z_]+]] : Arr)
+  // CHECK-NEXT: Val t = [[VAR]];
+  // CHECK-NEXT: int y = t.x;
+  // CHECK-NEXT: int z = [[VAR]].x + t.x;
+
   for (int i = 0; i < N; ++i) {
     Val &t = func(Arr[i]);
     int y = t.x;

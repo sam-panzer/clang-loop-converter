@@ -5,6 +5,8 @@ add_clang_executable(loop-convert
   LoopConvert.cpp
   LoopActions.cpp
   LoopActions.h
+  LoopMatchers.cpp
+  LoopMatchers.h
   StmtAncestor.cpp
   StmtAncestor.h
   VariableNaming.cpp

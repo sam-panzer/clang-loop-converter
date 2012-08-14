@@ -1,4 +1,5 @@
 #include "LoopActions.h"
+#include "LoopMatchers.h"
 #include "VariableNaming.h"
 
 #include "clang/Lex/Lexer.h"
@@ -9,15 +10,21 @@ namespace loop_migrate {
 using namespace clang::ast_matchers;
 using namespace clang::tooling;
 
-// Constants used for matcher name bindings
-const char LoopName[] = "forLoop";
-const char ConditionBoundName[] = "conditionBound";
-const char ConditionVarName[] = "conditionVar";
-const char IncrementVarName[] = "incrementVar";
-const char InitVarName[] = "initVar";
-
 typedef llvm::SmallPtrSet<const Expr *, 1> ContainerResult;
-typedef const Expr* Usage;
+
+/// Usage - the information needed to describe a valid convertible usage
+/// of an array index or iterator.
+struct Usage {
+  const Expr *E;
+  bool IsArrow;
+  /// Range is only used if IsArrow is set to true;
+  /// otherwise, E->getSourceRange() should be used.
+  /// This is needed to work around the range of operator-> not being exactly
+  /// what needs to be replaced.
+  SourceRange Range;
+};
+
+// The true return value of ForLoopIndexUseVisitor.
 typedef llvm::SmallVector<Usage, 8> UsageResult;
 
 /// ForLoopIndexUseVisitor - discover usages of expressions indexing into
@@ -28,9 +35,10 @@ typedef llvm::SmallVector<Usage, 8> UsageResult;
 class ForLoopIndexUseVisitor
     : public RecursiveASTVisitor<ForLoopIndexUseVisitor> {
  public:
-  ForLoopIndexUseVisitor(ASTContext *Context, const VarDecl *IndexVar) :
+  ForLoopIndexUseVisitor(ASTContext *Context, const VarDecl *IndexVar,
+                    const VarDecl *EndVar, const Expr *ContainerExpr) :
     OnlyUsedAsIndex(true), Context(Context), IndexVar(IndexVar),
-  AliasDecl(NULL) { }
+    EndVar(EndVar), AliasDecl(NULL), ContainerExpr(ContainerExpr)  { }
 
   /// Accessor for Usages.
   const UsageResult &getUsages() const { return Usages; }
@@ -73,18 +81,27 @@ class ForLoopIndexUseVisitor
   ContainerResult ContainersIndexed;
   /// The index variable's VarDecl.
   const VarDecl *IndexVar;
+  // The loop's 'end' variable, which cannot be mentioned at all.
+  const VarDecl *EndVar;
   // The DeclStmt for an alias to the container element.
   const DeclStmt *AliasDecl;
   // The Expr which refers to the container.
+  const Expr *ContainerExpr;
   TranslationConfidenceKind ConfidenceLevel;
 
-  // Typedef used in CRTP functions.
+  /// Typedef used in CRTP functions.
   typedef RecursiveASTVisitor<ForLoopIndexUseVisitor> VisitorBase;
   friend class RecursiveASTVisitor<ForLoopIndexUseVisitor>;
-  // Overriden methods for RecursiveASTVisitor's traversal
+
+  /// Overriden methods for RecursiveASTVisitor's traversal.
   bool TraverseArraySubscriptExpr(ArraySubscriptExpr *ASE);
+  bool TraverseCXXOperatorCallExpr(CXXOperatorCallExpr *OpCall);
+  bool TraverseMemberExpr(MemberExpr *Member);
+  bool TraverseUnaryOperator(UnaryOperator *Uop);
   bool VisitDeclRefExpr(DeclRefExpr *DRE);
   bool VisitDeclStmt(DeclStmt *DS);
+  // Used to call Traverse...Operator() correctly
+  bool TraverseStmt(Stmt *S);
 };
 
 // Obtain the original source code text from a SourceRange.
@@ -126,6 +143,15 @@ static bool areSameVariable(const ValueDecl *First, const ValueDecl *Second) {
          First->getCanonicalDecl() == Second->getCanonicalDecl();
 }
 
+// Determines if an expression is a declaration reference to a particular
+// variable.
+static bool exprIsVariable(const ValueDecl *Target, const Expr *E) {
+  if (!Target || !E)
+    return false;
+  const DeclRefExpr *DRE = getDeclRef(E);
+  return DRE && areSameVariable(Target, DRE->getDecl());
+}
+
 // Returns true when two Exprs are equivalent.
 static bool areSameExpr(ASTContext* Context, const Expr *First,
                         const Expr *Second) {
@@ -136,6 +162,29 @@ static bool areSameExpr(ASTContext* Context, const Expr *First,
   First->Profile(FirstID, *Context, true);
   Second->Profile(SecondID, *Context, true);
   return FirstID == SecondID;
+}
+
+/// Look through conversion/copy constructors to see the object being converted
+/// from, returning it if such an object is found. The point is to look at
+///   vector<int>::iterator it = v.begin()
+/// and retrieve `v.begin()` as the expression used to initialize `it`.
+static const Expr *digThroughConstructors(const Expr *E) {
+  if (!E)
+    return NULL;
+  E = E->IgnoreParenImpCasts();
+  if (const CXXConstructExpr *ConstructExpr = dyn_cast<CXXConstructExpr>(E)) {
+    // The initial constructor must take exactly one parameter, but base class
+    // and deferred constructors can take more.
+    if (ConstructExpr->getNumArgs() != 1 ||
+        ConstructExpr->getConstructionKind() != CXXConstructExpr::CK_Complete)
+      return NULL;
+    E = ConstructExpr->getArg(0);
+    if (const MaterializeTemporaryExpr *MTE =
+        dyn_cast<MaterializeTemporaryExpr>(E))
+      E = MTE->GetTemporaryExpr();
+    return digThroughConstructors(E);
+  }
+  return E;
 }
 
 // Returns true when the ContainerResult contains an Expr equivalent to E.
@@ -158,6 +207,22 @@ static bool isIndexInSubscriptExpr(const Expr *IndexExpr,
              && areSameVariable(IndexVar, Idx->getDecl());
 }
 
+// Returns true when Opcall is a call a one-parameter operator on IndexVar.
+// Note that this function assumes that the opcode is operator* or operator->.
+static bool isValidDereference(const CXXOperatorCallExpr *OpCall,
+                               const VarDecl *IndexVar) {
+  return OpCall->getNumArgs() == 1 &&
+         exprIsVariable(IndexVar, OpCall->getArg(0));
+}
+
+// Returns true when Uop is a dereference of IndexVar. Note that this is the
+// only isValidXXX function that confirms that the opcode is correct, as there
+// is only one way to trigger this case (namely, the builtin operator*).
+static bool isValidUop(const UnaryOperator *Uop, const VarDecl *IndexVar) {
+  return Uop->getOpcode() == UO_Deref &&
+      exprIsVariable(IndexVar, Uop->getSubExpr());
+}
+
 // Determines whether the given Decl defines an alias to the given variable.
 static bool isAliasDecl(const Decl *TheDecl, const VarDecl *TargetDecl) {
   const VarDecl *VDecl = dyn_cast<VarDecl>(TheDecl);
@@ -166,12 +231,29 @@ static bool isAliasDecl(const Decl *TheDecl, const VarDecl *TargetDecl) {
 
   if (!VDecl->hasInit())
     return false;
-  const Expr *Init = VDecl->getInit()->IgnoreImpCasts();
-  if (Init->getStmtClass() == Stmt::ArraySubscriptExprClass) {
+  const Expr *Init = 
+      digThroughConstructors(VDecl->getInit()->IgnoreImpCasts());
+
+  switch (Init->getStmtClass()) {
+  case Stmt::ArraySubscriptExprClass: {
     const ArraySubscriptExpr *ASE = cast<ArraySubscriptExpr>(Init);
     // We don't really care which array is used here. We check to make sure
     // it was the correct one later, since the AST will traverse it next.
     return isIndexInSubscriptExpr(ASE->getIdx(), TargetDecl, ASE->getBase());
+  }
+
+  case Stmt::UnaryOperatorClass:
+    return isValidUop(cast<UnaryOperator>(Init), TargetDecl);
+
+  case Stmt::CXXOperatorCallExprClass: {
+      const CXXOperatorCallExpr *OpCall = cast<CXXOperatorCallExpr>(Init);
+      if (OpCall->getOperator() == OO_Star)
+        return isValidDereference(OpCall, TargetDecl);
+      break;
+  }
+
+  default:
+    break;
   }
   return false;
 }
@@ -192,6 +274,105 @@ static bool arrayMatchesBoundExpr(ASTContext *Context,
   return false;
 }
 
+// A workaround to allow a redefinition of Traverse...Operator.
+bool ForLoopIndexUseVisitor::TraverseStmt(Stmt *S) {
+  // Without this, an assert is triggered somewhere in RecursiveASTVisitor.
+  if (!S)
+    return true;
+
+  switch (S->getStmtClass()) {
+  case Stmt::UnaryOperatorClass:
+   return TraverseUnaryOperator(cast<UnaryOperator>(S));
+  default:
+    return VisitorBase::TraverseStmt(S);
+  }
+}
+
+// Traverses the subexpression of Uop. Permitted usages here are dereferences of
+// pointer types.
+bool ForLoopIndexUseVisitor::TraverseUnaryOperator(UnaryOperator *Uop) {
+  // If we dereference an iterator that's actually a pointer, count the
+  // occurrence.
+  if (isValidUop(Uop, IndexVar)) {
+    Usage U = {Uop, /*IsArrow=*/false, SourceRange()};
+    Usages.push_back(U);
+    return true;
+  }
+
+  // Otherwise, continue recursively.
+  return TraverseStmt(Uop->getSubExpr());
+}
+
+/// Arrow expressions are okay in iterator loops, so we note them
+/// for conversion.
+bool ForLoopIndexUseVisitor::TraverseMemberExpr(MemberExpr *Member) {
+  const Expr *Base = Member->getBase();
+  const DeclRefExpr *Obj = getDeclRef(Base);
+  const Expr *ResultExpr = Member;
+  QualType ExprType;
+  if (const CXXOperatorCallExpr *Call =
+      dyn_cast<CXXOperatorCallExpr>(Base->IgnoreParenImpCasts())) {
+    // If operator->() is a MemberExpr containing a CXXOperatorCallExpr, then
+    // the MemberExpr does not have the expression we want. We therefore catch
+    // that instance here.
+    if(Call->getOperator() == OO_Arrow) {
+      assert(Call->getNumArgs() == 1 &&
+             "Operator-> takes more than one argument");
+      Obj = getDeclRef(Call->getArg(0));
+      ResultExpr = Obj;
+      ExprType = Call->getCallReturnType();
+    }
+  }
+
+  if (Member->isArrow() && Obj && exprIsVariable(IndexVar, Obj)) {
+    if (ExprType.isNull())
+      ExprType = Obj->getType();
+
+    assert(ExprType->isPointerType() && "Operator-> returned non-pointer type");
+    // FIXME: This works around not having the location of the arrow operator.
+    // Consider adding OperatorLoc to MemberExpr?
+    SourceLocation ArrowLoc =
+        Lexer::getLocForEndOfToken(Base->getExprLoc(), 0,
+                                   Context->getSourceManager(),
+                                   Context->getLangOpts());
+    // If something complicated is happening (i.e. the next token isn't an
+    // arrow), give up on making this work.
+    if (!ArrowLoc.isInvalid()) {
+      Usage U = {ResultExpr, /*IsArrow=*/true,
+                 SourceRange(Base->getExprLoc(), ArrowLoc)};
+      Usages.push_back(U);
+      return true;
+    }
+  }
+  return TraverseStmt(Member->getBase());
+}
+
+// Overloaded operator* and operator-> are permitted for iterator-based loops.
+bool ForLoopIndexUseVisitor::TraverseCXXOperatorCallExpr(
+    CXXOperatorCallExpr *OpCall) {
+  switch (OpCall->getOperator()) {
+  case OO_Star:
+    if (isValidDereference(OpCall, IndexVar)) {
+      Usage U = {OpCall, /*IsArrow=*/false, SourceRange()};
+      Usages.push_back(U);
+      return true;
+    }
+    break;
+
+  case OO_Arrow:
+    if (isValidDereference(OpCall, IndexVar)) {
+      Usage U = {OpCall, /*IsArrow=*/true,
+                 SourceRange(OpCall->getLocStart(), OpCall->getOperatorLoc())};
+      Usages.push_back(U);
+      return true;
+    }
+
+  default:
+    break;
+  }
+  return VisitorBase::TraverseCXXOperatorCallExpr(OpCall);
+}
+
 // If we encounter an array with IndexVar as the index, note it and prune the
 // AST traversal so that VisitDeclRefExpr() doesn't discover the reference to
 // the index and mark it as unconvertible.
@@ -203,7 +384,8 @@ bool ForLoopIndexUseVisitor::TraverseArraySubscriptExpr(
     const Expr *ArrReduced = Arr->IgnoreParenCasts();
     if (!containsExpr(Context, &ContainersIndexed, ArrReduced))
       ContainersIndexed.insert(ArrReduced);
-    Usages.push_back(ASE);
+    Usage U = {ASE, /*IsArrow=*/false, SourceRange()};
+    Usages.push_back(U);
     return true;
   }
   return VisitorBase::TraverseArraySubscriptExpr(ASE);
@@ -213,7 +395,7 @@ bool ForLoopIndexUseVisitor::TraverseArraySubscriptExpr(
 // traversal, mark this loop as unconvertible.
 bool ForLoopIndexUseVisitor::VisitDeclRefExpr(DeclRefExpr *DRE) {
   const ValueDecl *TheDecl = DRE->getDecl();
-  if (areSameVariable(IndexVar, TheDecl))
+  if (areSameVariable(IndexVar, TheDecl) || areSameVariable(EndVar, TheDecl))
     OnlyUsedAsIndex = false;
   return true;
 }
@@ -230,9 +412,11 @@ bool ForLoopIndexUseVisitor::VisitDeclStmt(DeclStmt *DS) {
 // Apply the source transformations necessary to migrate the loop!
 static void doConversion(ASTContext *Context, LoopFixerArgs *Args,
                          const StmtParentMap *ParentMap,
-                         const VarDecl *IndexVar, const Expr *ContainerExpr,
+                         const VarDecl *IndexVar, const VarDecl *EndVar,
+                         const Expr *ContainerExpr,
                          const UsageResult &Usages, const DeclStmt *AliasDecl,
-                         const ForStmt *TheLoop) {
+                         const ForStmt *TheLoop,
+                         bool ContainerNeedsDereference) {
   const VarDecl *MaybeContainer = getReferencedVariable(ContainerExpr);
   std::string VarName;
 
@@ -256,8 +440,15 @@ static void doConversion(ASTContext *Context, LoopFixerArgs *Args,
     // variable.
     for (UsageResult::const_iterator I = Usages.begin(), E = Usages.end();
          I != E; ++I) {
-      SourceRange ReplaceRange = (*I)->getSourceRange();
-      std::string ReplaceText = VarName;
+      std::string ReplaceText;
+      SourceRange ReplaceRange;
+      if (I->IsArrow) {
+        ReplaceRange = I->Range;
+        ReplaceText = VarName + ".";
+      } else {
+        ReplaceRange = I->E->getSourceRange();
+        ReplaceText = VarName;
+      }
       Args->ReplacedVarRanges->insert(std::make_pair(TheLoop, IndexVar));
       if (!Args->CountOnly)
         Args->Replace->insert(
@@ -275,15 +466,73 @@ static void doConversion(ASTContext *Context, LoopFixerArgs *Args,
 
   QualType AutoRefType =
       Context->getLValueReferenceType(Context->getAutoDeductType());
-  std::string TypeString = AutoRefType.getAsString();
 
+  std::string MaybeDereference = ContainerNeedsDereference ? "*" : "";
+  std::string TypeString = AutoRefType.getAsString();
   std::string Range = ("(" + TypeString + " " + VarName + " : "
-                           + ContainerString + ")").str();
+                           + MaybeDereference + ContainerString + ")").str();
   if (!Args->CountOnly)
     Args->Replace->insert(Replacement(Context->getSourceManager(),
                                      CharSourceRange::getTokenRange(ParenRange),
                                      Range));
   Args->GeneratedDecls->insert(make_pair(TheLoop, VarName));
+}
+
+
+/// Determine whether VDecl appears to be an initializing an iterator.
+/// If it is, returns the object whose begin() or end()
+/// method is called, and the output parameter isArrow is set to indicate
+/// whether the initialization is called via . or ->.
+static const Expr *getContainerFromInitializer(const Expr* Init,
+                                               bool IsBegin, bool *IsArrow) {
+  // FIXME: Maybe allow declaration/initialization outside of the for loop?
+  const CXXMemberCallExpr *TheCall =
+      dyn_cast_or_null<CXXMemberCallExpr>(digThroughConstructors(Init));
+  if (!TheCall || TheCall->getNumArgs() != 0)
+      return NULL;
+
+  const MemberExpr *Member = cast<MemberExpr>(TheCall->getCallee());
+  const std::string Name = Member->getMemberDecl()->getName();
+  const std::string TargetName = IsBegin ? "begin" : "end";
+  if (Name != TargetName)
+    return NULL;
+
+  const Expr *SourceExpr = Member->getBase();
+  if (!SourceExpr)
+    return NULL;
+
+  *IsArrow = Member->isArrow();
+  return SourceExpr;
+}
+
+/// Determines the variable whose begin() and end() functions are called for an
+/// iterator-based loop.
+static const Expr *findContainer(ASTContext *Context, const VarDecl *BeginVar,
+                                 const VarDecl *EndVar,
+                                 bool *ContainerNeedsDereference) {
+  const Expr *BeginInitExpr = BeginVar->getInit();
+  const Expr *EndInitExpr = EndVar->getInit();
+
+  // Now that we know the loop variable and test expression, make sure they are
+  // valid.
+  bool BeginIsArrow = false;
+  bool EndIsArrow = false;
+  const Expr *ContainerExpr = getContainerFromInitializer(BeginInitExpr,
+                                                          /*IsBegin=*/true,
+                                                          &BeginIsArrow);
+  if (!ContainerExpr)
+      return NULL;
+  const Expr *EndSourceExpr = getContainerFromInitializer(EndInitExpr,
+                                                          /*IsBegin=*/false,
+                                                          &EndIsArrow);
+  // Disallow loops that try evil things like this (note the dot and arrow):
+  //  for (IteratorType It = Obj.begin(), E = Obj->end(); It != E; ++It) { }
+  if (!EndSourceExpr || BeginIsArrow != EndIsArrow ||
+      !areSameExpr(Context, EndSourceExpr, ContainerExpr))
+    return NULL;
+
+  *ContainerNeedsDereference = BeginIsArrow;
+  return ContainerExpr;
 }
 
 // The LoopFixer callback, which determines if loops discovered by the
@@ -303,10 +552,46 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
   if (!areSameVariable(LoopVar, CondVar) || !areSameVariable(LoopVar, InitVar))
     return;
   const Expr *BoundExpr= Result.Nodes.getStmtAs<Expr>(ConditionBoundName);
+  const VarDecl *EndVar = Result.Nodes.getDeclAs<VarDecl>(EndVarName);
+  const Expr *ContainerExpr = NULL;
 
-  ForLoopIndexUseVisitor Finder(Context, LoopVar);
+  if (FixerKind != LFK_Array && !EndVar)
+      return;
+
+  bool ContainerNeedsDereference = false;
+  // FIXME: Try to put most of this logic inside a matcher. Currently, matchers
+  // don't allow the right-recursive checks in digThroughConstructors.
+  if (FixerKind == LFK_Iterator)
+    ContainerExpr = findContainer(Context, LoopVar, EndVar,
+                                  &ContainerNeedsDereference);
+
+  ForLoopIndexUseVisitor Finder(Context, LoopVar, EndVar, ContainerExpr);
+  if (!ContainerExpr && !BoundExpr)
+    return;
+
+  // Either a container or an integral upper bound must exist.
   if (!Finder.findUsages(FS->getBody()))
     return;
+
+  ConfidenceLevel = std::min(ConfidenceLevel, Finder.getConfidenceLevel());
+  // We require that a single array/container be indexed into by LoopVar.
+  // This check is done by ForLoopIndexUseVisitor for non-array loops, but we may not
+  // know which array is being looped over until the end of the traversal.
+  if (FixerKind == LFK_Array) {
+    const ContainerResult &ContainersIndexed = Finder.getContainersIndexed();
+    if (ContainersIndexed.size() != 1)
+      return;
+
+    ContainerExpr = *(ContainersIndexed.begin());
+    if (!arrayMatchesBoundExpr(Context, ContainerExpr->getType(), BoundExpr))
+      return;
+    // Very few loops are over expressions that generate arrays rather than
+    // array variables. Consider loops over arrays that aren't just represented
+    // by a variable to be risky conversions.
+    if (!getReferencedVariable(ContainerExpr) &&
+        !isDirectMemberExpr(ContainerExpr))
+      ConfidenceLevel = std::min(ConfidenceLevel, TCK_Risky);
+  }
 
   // If we already modified the range of this for loop, don't do any further
   // updates on this iteration.
@@ -316,24 +601,6 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
     Args->DeferredChanges++;
     return;
   }
-
-  ConfidenceLevel = std::min(ConfidenceLevel, Finder.getConfidenceLevel());
-
-  // We require that a single array be indexed into by LoopVar.
-  const ContainerResult &ContainersIndexed = Finder.getContainersIndexed();
-  if (ContainersIndexed.size() != 1)
-    return;
-
-  const Expr *ContainerExpr = *(ContainersIndexed.begin());
-  if (!arrayMatchesBoundExpr(Context, ContainerExpr->getType(), BoundExpr))
-    return;
-
-  // Very few loops are over expressions that generate arrays rather than
-  // array variables. Consider loops over arrays that aren't just represented
-  // by a variable to be risky conversions.
-  if (!getReferencedVariable(ContainerExpr) &&
-      !isDirectMemberExpr(ContainerExpr))
-    ConfidenceLevel = std::min(ConfidenceLevel, TCK_Risky);
 
   ParentFinder->gatherAncestors(Context->getTranslationUnitDecl(),
                                 /*RunEvenIfNotEmpty=*/false);
@@ -358,8 +625,8 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
   }
 
   doConversion(Context, Args, &ParentFinder->getStmtToParentStmtMap(),
-               LoopVar, ContainerExpr, Finder.getUsages(),
-               Finder.getAliasDecl(), FS);
+               LoopVar, EndVar, ContainerExpr, Finder.getUsages(),
+               Finder.getAliasDecl(), FS, ContainerNeedsDereference);
 
   Args->AcceptedChanges++;
 }

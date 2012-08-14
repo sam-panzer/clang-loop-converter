@@ -22,6 +22,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LoopActions.h"
+#include "LoopMatchers.h"
 
 #include "clang/Basic/FileManager.h"
 #include "clang/Frontend/CompilerInstance.h"
@@ -97,8 +98,10 @@ int main(int argc, const char **argv) {
                              /*DeferredChanges=*/0, /*RejectedChanges=*/0,
                              CountOnly, TransformationLevel};
   MatchFinder Finder;
-  LoopFixer ArrayLoopFixer(&FixerArgs, &ParentFinder);
-  Finder.addMatcher(LoopMatcher, &ArrayLoopFixer);
+  LoopFixer ArrayLoopFixer(&FixerArgs, &ParentFinder, LFK_Array);
+  Finder.addMatcher(makeArrayLoopMatcher(), &ArrayLoopFixer);
+  LoopFixer IteratorLoopFixer(&FixerArgs, &ParentFinder, LFK_Iterator);
+  Finder.addMatcher(makeIteratorLoopMatcher(), &IteratorLoopFixer);
   if (int result = LoopTool.run(newFrontendActionFactory(&Finder))) {
     llvm::errs() << "Error encountered during translation.\n";
     return result;
