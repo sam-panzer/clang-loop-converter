@@ -10,7 +10,8 @@ namespace loop_migrate {
 using namespace clang::ast_matchers;
 using namespace clang::tooling;
 
-typedef llvm::SmallPtrSet<const Expr *, 1> ContainerResult;
+typedef llvm::SmallVector<
+  std::pair<const Expr *, llvm::FoldingSetNodeID>, 1> ContainerResult;
 
 /// Usage - the information needed to describe a valid convertible usage
 /// of an array index or iterator.
@@ -38,7 +39,10 @@ class ForLoopIndexUseVisitor
   ForLoopIndexUseVisitor(ASTContext *Context, const VarDecl *IndexVar,
                     const VarDecl *EndVar, const Expr *ContainerExpr) :
     OnlyUsedAsIndex(true), Context(Context), IndexVar(IndexVar),
-    EndVar(EndVar), AliasDecl(NULL), ContainerExpr(ContainerExpr)  { }
+    EndVar(EndVar), AliasDecl(NULL), ContainerExpr(ContainerExpr)  {
+      if (ContainerExpr)
+        addComponent(ContainerExpr);
+    }
 
   /// Accessor for Usages.
   const UsageResult &getUsages() const { return Usages; }
@@ -56,6 +60,14 @@ class ForLoopIndexUseVisitor
   /// Returns the statement declaring the variable created as an alias for the
   /// loop element, if any.
   const DeclStmt *getAliasDecl() const { return AliasDecl; }
+
+  /// Add a set of components that we should consider relevant to the container.
+  void addComponents(const ComponentVector &Components) {
+    // FIXME: add sort(on ID)+unique to avoid extra work.
+    for (ComponentVector::const_iterator I = Components.begin(),
+                                         E = Components.end(); I != E; ++I)
+      addComponent(*I);
+  }
 
   // Finds all uses of IndexVar in Body, placing all usages in Usages, all
   // referenced arrays in ContainersIndexed, and returns true if IndexVar was
@@ -88,6 +100,15 @@ class ForLoopIndexUseVisitor
   // The Expr which refers to the container.
   const Expr *ContainerExpr;
   TranslationConfidenceKind ConfidenceLevel;
+  llvm::SmallVector<
+      std::pair<const Expr *, llvm::FoldingSetNodeID>, 16> DependentExprs;
+
+  void addComponent(const Expr *E) {
+    llvm::FoldingSetNodeID ID;
+    const Expr *Node = E->IgnoreParenImpCasts();
+    Node->Profile(ID, *Context, true);
+    DependentExprs.push_back(std::make_pair(Node, ID));
+  }
 
   /// Typedef used in CRTP functions.
   typedef RecursiveASTVisitor<ForLoopIndexUseVisitor> VisitorBase;
@@ -95,6 +116,7 @@ class ForLoopIndexUseVisitor
 
   /// Overriden methods for RecursiveASTVisitor's traversal.
   bool TraverseArraySubscriptExpr(ArraySubscriptExpr *ASE);
+  bool TraverseCXXMemberCallExpr(CXXMemberCallExpr *MemberCall);
   bool TraverseCXXOperatorCallExpr(CXXOperatorCallExpr *OpCall);
   bool TraverseMemberExpr(MemberExpr *Member);
   bool TraverseUnaryOperator(UnaryOperator *Uop);
@@ -188,11 +210,14 @@ static const Expr *digThroughConstructors(const Expr *E) {
 }
 
 // Returns true when the ContainerResult contains an Expr equivalent to E.
-static bool containsExpr(ASTContext *Context, const ContainerResult *Container,
+template<typename ContainerT>
+static bool containsExpr(ASTContext *Context, const ContainerT *Container,
                          const Expr *E) {
-  for (ContainerResult::const_iterator I = Container->begin(),
+  llvm::FoldingSetNodeID ID;
+  E->Profile(ID, *Context, true);
+  for (typename ContainerT::const_iterator I = Container->begin(),
        End = Container->end(); I != End; ++I)
-    if (areSameExpr(Context, E, *I))
+    if (ID == I->second)
       return true;
   return false;
 }
@@ -231,7 +256,7 @@ static bool isAliasDecl(const Decl *TheDecl, const VarDecl *TargetDecl) {
 
   if (!VDecl->hasInit())
     return false;
-  const Expr *Init = 
+  const Expr *Init =
       digThroughConstructors(VDecl->getInit()->IgnoreImpCasts());
 
   switch (Init->getStmtClass()) {
@@ -347,6 +372,21 @@ bool ForLoopIndexUseVisitor::TraverseMemberExpr(MemberExpr *Member) {
   return TraverseStmt(Member->getBase());
 }
 
+// Calls on the iterator object are not permitted, unless done through
+// operator->().
+bool ForLoopIndexUseVisitor::TraverseCXXMemberCallExpr(
+    CXXMemberCallExpr *MemberCall) {
+  MemberExpr *Member = cast<MemberExpr>(MemberCall->getCallee());
+
+  if (containsExpr(Context, &DependentExprs, Member->getBase()))
+    ConfidenceLevel = std::min(ConfidenceLevel, TCK_Risky);
+
+  bool BaseResult = TraverseMemberExpr(Member);
+  for (unsigned I = 0; I < MemberCall->getNumArgs(); ++I)
+    BaseResult = BaseResult && TraverseStmt(MemberCall->getArg(I));
+  return BaseResult;
+}
+
 // Overloaded operator* and operator-> are permitted for iterator-based loops.
 bool ForLoopIndexUseVisitor::TraverseCXXOperatorCallExpr(
     CXXOperatorCallExpr *OpCall) {
@@ -382,8 +422,11 @@ bool ForLoopIndexUseVisitor::TraverseArraySubscriptExpr(
   Expr *Arr = ASE->getBase();
   if (isIndexInSubscriptExpr(ASE->getIdx(), IndexVar, Arr)) {
     const Expr *ArrReduced = Arr->IgnoreParenCasts();
-    if (!containsExpr(Context, &ContainersIndexed, ArrReduced))
-      ContainersIndexed.insert(ArrReduced);
+    if (!containsExpr(Context, &ContainersIndexed, ArrReduced)) {
+      llvm::FoldingSetNodeID ID;
+      ArrReduced->Profile(ID, *Context, true);
+      ContainersIndexed.push_back(std::make_pair(ArrReduced, ID));
+    }
     Usage U = {ASE, /*IsArrow=*/false, SourceRange()};
     Usages.push_back(U);
     return true;
@@ -397,6 +440,8 @@ bool ForLoopIndexUseVisitor::VisitDeclRefExpr(DeclRefExpr *DRE) {
   const ValueDecl *TheDecl = DRE->getDecl();
   if (areSameVariable(IndexVar, TheDecl) || areSameVariable(EndVar, TheDecl))
     OnlyUsedAsIndex = false;
+  if (containsExpr(Context, &DependentExprs, DRE))
+    ConfidenceLevel = std::min(ConfidenceLevel, TCK_Risky);
   return true;
 }
 
@@ -478,7 +523,6 @@ static void doConversion(ASTContext *Context, LoopFixerArgs *Args,
   Args->GeneratedDecls->insert(make_pair(TheLoop, VarName));
 }
 
-
 /// Determine whether VDecl appears to be an initializing an iterator.
 /// If it is, returns the object whose begin() or end()
 /// method is called, and the output parameter isArrow is set to indicate
@@ -508,10 +552,10 @@ static const Expr *getContainerFromInitializer(const Expr* Init,
 /// Determines the variable whose begin() and end() functions are called for an
 /// iterator-based loop.
 static const Expr *findContainer(ASTContext *Context, const VarDecl *BeginVar,
-                                 const VarDecl *EndVar,
+                                 const VarDecl *EndVar, const Expr *EndExpr,
                                  bool *ContainerNeedsDereference) {
   const Expr *BeginInitExpr = BeginVar->getInit();
-  const Expr *EndInitExpr = EndVar->getInit();
+  const Expr *EndInitExpr = EndVar ? EndVar->getInit() : EndExpr;
 
   // Now that we know the loop variable and test expression, make sure they are
   // valid.
@@ -555,18 +599,34 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
   const VarDecl *EndVar = Result.Nodes.getDeclAs<VarDecl>(EndVarName);
   const Expr *ContainerExpr = NULL;
 
-  if (FixerKind != LFK_Array && !EndVar)
+  // If the end comparison isn't a variable, we can try to work with the
+  // expression the loop variable is being tested against instead.
+  const CXXMemberCallExpr *EndCall =
+      Result.Nodes.getStmtAs<CXXMemberCallExpr>(EndCallName);
+
+  // If the loop calls end()/size() after each iteration, lower our confidence
+  // level.
+  if (FixerKind != LFK_Array && !EndVar) {
+    if (!EndCall)
       return;
+    ConfidenceLevel = std::min(ConfidenceLevel, TCK_Extra);
+  }
 
   bool ContainerNeedsDereference = false;
   // FIXME: Try to put most of this logic inside a matcher. Currently, matchers
   // don't allow the right-recursive checks in digThroughConstructors.
   if (FixerKind == LFK_Iterator)
-    ContainerExpr = findContainer(Context, LoopVar, EndVar,
+    ContainerExpr = findContainer(Context, LoopVar, EndVar, EndCall,
                                   &ContainerNeedsDereference);
 
   ForLoopIndexUseVisitor Finder(Context, LoopVar, EndVar, ContainerExpr);
-  if (!ContainerExpr && !BoundExpr)
+
+  // Either a container or an integral upper bound must exist.
+  if (ContainerExpr) {
+    ComponentFinderASTVisitor ComponentFinder;
+    ComponentFinder.findExprComponents(ContainerExpr->IgnoreParenImpCasts());
+    Finder.addComponents(ComponentFinder.getComponents());
+  } else if (!BoundExpr)
     return;
 
   // Either a container or an integral upper bound must exist.
@@ -582,7 +642,7 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
     if (ContainersIndexed.size() != 1)
       return;
 
-    ContainerExpr = *(ContainersIndexed.begin());
+    ContainerExpr = ContainersIndexed.begin()->first;
     if (!arrayMatchesBoundExpr(Context, ContainerExpr->getType(), BoundExpr))
       return;
     // Very few loops are over expressions that generate arrays rather than

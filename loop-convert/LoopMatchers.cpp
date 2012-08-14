@@ -70,10 +70,11 @@ StatementMatcher makeIteratorLoopMatcher() {
       hasArgument(1, IteratorBoundMatcher));
 
   return id(LoopName, forStmt(
-            hasLoopInit(
+            hasLoopInit(anyOf(
                 declarationStatement(declCountIs(2),
                                      containsDeclaration(0, InitDeclMatcher),
-                                     containsDeclaration(1, EndDeclMatcher))),
+                                     containsDeclaration(1, EndDeclMatcher)),
+                declarationStatement(hasSingleDecl(InitDeclMatcher)))),
             hasCondition(anyOf(
                 binaryOperator(hasOperatorName("!="),
                                hasLHS(IteratorComparisonMatcher),

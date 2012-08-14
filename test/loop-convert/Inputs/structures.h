@@ -51,6 +51,13 @@ struct U {
   int x;
 };
 
+struct X {
+  S s;
+  T t;
+  U u;
+  S getS();
+};
+
 template<typename ElemType>
 class dependent{
  public:

@@ -110,17 +110,17 @@ void differentContainers() {
     MutableVal k = *i;
 }
 
-struct EvilArrow : T {
+struct EvilArrow : U {
   // Please, no one ever write code like this.
-  T* operator->();
+  U* operator->();
 };
 
 void differentMemberAccessTypes() {
   EvilArrow A;
   for (EvilArrow::iterator i = A.begin(), e = A->end(); i != e; ++i)
-    int k = *i;
+    Val k = *i;
   for (EvilArrow::iterator i = A->begin(), e = A.end(); i != e; ++i)
-    int k = *i;
+    Val k = *i;
 }
 
 void f(const T::iterator &it, int);
