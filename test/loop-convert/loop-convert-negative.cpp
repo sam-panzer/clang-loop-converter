@@ -2,12 +2,13 @@
 // RUN: grep -Ev "//\s*[A-Z-]+:" %s > %t.cpp
 // RUN: grep -Ev "//\s*[A-Z-]+:" %S/Inputs/negative-header.h > \
 // RUN:       %T/negative-header.h
-// RUN: loop-convert . %t.cpp -- && FileCheck -input-file=%t.cpp %s \
+// RUN: loop-convert . %t.cpp -- -I %S/Inputs/ \
+// RUN:   && FileCheck -input-file=%t.cpp %s \
 // RUN:   && FileCheck -input-file=%T/negative-header.h \
 // RUN:                %S/Inputs/negative-header.h
 
 #include "negative-header.h"
-struct T { void g(); };
+#include "structures.h"
 
 // Single FileCheck line to make sure that no loops are converted.
 // CHECK-NOT: for ({{.*[^:]:[^:].*}})
@@ -89,3 +90,31 @@ void multipleArrays() {
   for (int i = 0; i < N; ++i)
     sum += arr[i] + badArr[i];
 }
+
+struct HasArr {
+  int Arr[N];
+  Val ValArr[N];
+};
+
+struct HasIndirectArr {
+  HasArr HA;
+  void implicitThis() {
+    for (int i = 0; i < N; ++i) {
+      printf("%d", HA.Arr[i]);
+    }
+
+    for (int i = 0; i < N; ++i) {
+      printf("%d", HA.ValArr[i].x);
+    }
+  }
+
+  void explicitThis() {
+    for (int i = 0; i < N; ++i) {
+      printf("%d", this->HA.Arr[i]);
+    }
+
+    for (int i = 0; i < N; ++i) {
+      printf("%d", this->HA.ValArr[i].x);
+    }
+  }
+};

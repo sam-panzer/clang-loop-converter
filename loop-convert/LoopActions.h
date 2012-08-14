@@ -24,6 +24,13 @@ namespace loop_migrate {
 using clang::ast_matchers::MatchFinder;
 using clang::ast_matchers::StatementMatcher;
 
+/// \brief The level of safety to require of transformations.
+enum TranslationConfidenceKind {
+  TCK_Risky,
+  TCK_Extra,
+  TCK_Safe
+};
+
 /// \brief Argument pack for LoopFixer.
 ///
 // Contains long-lived data structures that should be preserved across matcher
@@ -32,6 +39,11 @@ struct LoopFixerArgs {
   tooling::Replacements *Replace;
   StmtGeneratedVarNameMap *GeneratedDecls;
   ReplacedVarsMap *ReplacedVarRanges;
+  unsigned AcceptedChanges;
+  unsigned DeferredChanges;
+  unsigned RejectedChanges;
+  bool CountOnly;
+  TranslationConfidenceKind ConfidenceLevel;
 };
 
 /// LoopFixer: The callback to be used for loop migration matchers.

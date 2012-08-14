@@ -7,6 +7,7 @@ namespace clang {
 namespace loop_migrate {
 
 using namespace clang::ast_matchers;
+using namespace clang::tooling;
 
 // Constants used for matcher name bindings
 const char LoopName[] = "forLoop";
@@ -18,8 +19,6 @@ const char InitVarName[] = "initVar";
 typedef llvm::SmallPtrSet<const Expr *, 1> ContainerResult;
 typedef const Expr* Usage;
 typedef llvm::SmallVector<Usage, 8> UsageResult;
-using tooling::Replacement;
-using tooling::Replacements;
 
 /// ForLoopIndexUseVisitor - discover usages of expressions indexing into
 /// containers.
@@ -40,6 +39,11 @@ class ForLoopIndexUseVisitor
     return ContainersIndexed;
   }
 
+  /// Accessor for ConfidenceLevel.
+  TranslationConfidenceKind getConfidenceLevel() const {
+    return ConfidenceLevel;
+  }
+
   // Finds all uses of IndexVar in Body, placing all usages in Usages, all
   // referenced arrays in ContainersIndexed, and returns true if IndexVar was
   // only used as an array index.
@@ -49,6 +53,7 @@ class ForLoopIndexUseVisitor
   // For arrays, the DeclRefExpr for IndexVar must appear as the index of an
   // ArraySubscriptExpression.
   bool findUsages(const Stmt *Body) {
+    ConfidenceLevel = TCK_Safe;
     TraverseStmt(const_cast<Stmt *>(Body));
     return OnlyUsedAsIndex;
   }
@@ -63,6 +68,8 @@ class ForLoopIndexUseVisitor
   ContainerResult ContainersIndexed;
   // The index variable's VarDecl.
   const VarDecl *IndexVar;
+  // The Expr which refers to the container.
+  TranslationConfidenceKind ConfidenceLevel;
 
   // Typedef used in CRTP functions.
   typedef RecursiveASTVisitor<ForLoopIndexUseVisitor> VisitorBase;
@@ -96,6 +103,13 @@ static const VarDecl *getReferencedVariable(const Expr *E) {
   if (const DeclRefExpr *DRE = getDeclRef(E))
     return dyn_cast<VarDecl>(DRE->getDecl());
   return NULL;
+}
+
+// Returns true when the given expression is a direct member expression
+static bool isDirectMemberExpr(const Expr *E) {
+  if (const MemberExpr *Member = dyn_cast<MemberExpr>(E->IgnoreParenImpCasts()))
+    return isa<CXXThisExpr>(Member->getBase()->IgnoreParenImpCasts());
+  return false;
 }
 
 // Returns true when two ValueDecls are the same variable.
@@ -196,10 +210,11 @@ static void doConversion(ASTContext *Context, LoopFixerArgs *Args,
     SourceRange ReplaceRange = (*I)->getSourceRange();
     std::string ReplaceText = VarName;
     Args->ReplacedVarRanges->insert(std::make_pair(TheLoop, IndexVar));
-    Args->Replace->insert(
-        Replacement(Context->getSourceManager(),
-                    CharSourceRange::getTokenRange(ReplaceRange),
-                    ReplaceText));
+    if (!Args->CountOnly)
+      Args->Replace->insert(
+          Replacement(Context->getSourceManager(),
+                      CharSourceRange::getTokenRange(ReplaceRange),
+                      ReplaceText));
   }
 
   // Now, we need to construct the new range expresion.
@@ -214,15 +229,17 @@ static void doConversion(ASTContext *Context, LoopFixerArgs *Args,
 
   std::string Range = ("(" + TypeString + " " + VarName + " : "
                            + ContainerString + ")").str();
-  Args->Replace->insert(Replacement(Context->getSourceManager(),
-                                   CharSourceRange::getTokenRange(ParenRange),
-                                   Range));
+  if (!Args->CountOnly)
+    Args->Replace->insert(Replacement(Context->getSourceManager(),
+                                     CharSourceRange::getTokenRange(ParenRange),
+                                     Range));
   Args->GeneratedDecls->insert(make_pair(TheLoop, VarName));
 }
 
 // The LoopFixer callback, which determines if loops discovered by the
 // matchers are convertible, printing information about the loops if so.
 void LoopFixer::run(const MatchFinder::MatchResult &Result) {
+  TranslationConfidenceKind ConfidenceLevel = TCK_Safe;
   ASTContext *Context = Result.Context;
   const ForStmt *FS = Result.Nodes.getStmtAs<ForStmt>(LoopName);
 
@@ -245,8 +262,12 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
   // updates on this iteration.
   // FIXME: Once Replacements can detect conflicting edits, replace this
   // implementation and rely on conflicting edit detection instead.
-  if (Args->ReplacedVarRanges->count(FS))
+  if (Args->ReplacedVarRanges->count(FS)) {
+    Args->DeferredChanges++;
     return;
+  }
+
+  ConfidenceLevel = std::min(ConfidenceLevel, Finder.getConfidenceLevel());
 
   // We require that a single array be indexed into by LoopVar.
   const ContainerResult &ContainersIndexed = Finder.getContainersIndexed();
@@ -256,6 +277,14 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
   const Expr *ContainerExpr = *(ContainersIndexed.begin());
   if (!arrayMatchesBoundExpr(Context, ContainerExpr->getType(), BoundExpr))
     return;
+
+  // Very few loops are over expressions that generate arrays rather than
+  // array variables. Consider loops over arrays that aren't just represented
+  // by a variable to be risky conversions.
+  if (!getReferencedVariable(ContainerExpr) &&
+      !isDirectMemberExpr(ContainerExpr))
+    ConfidenceLevel = std::min(ConfidenceLevel, TCK_Risky);
+
   ParentFinder->gatherAncestors(Context->getTranslationUnitDecl(),
                                 /*RunEvenIfNotEmpty=*/false);
 
@@ -265,11 +294,22 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
       DependencyFinder(&ParentFinder->getStmtToParentStmtMap(),
                        &ParentFinder->getDeclToParentStmtMap(),
                        Args->ReplacedVarRanges, FS);
-  if (DependencyFinder.dependsOnOutsideVariable(ContainerExpr))
+  // Not all of these are actually deferred changes.
+  // FIXME: Determine when the external dependency isn't an expression converted
+  // by another loop.
+  if (DependencyFinder.dependsOnOutsideVariable(ContainerExpr)) {
+    Args->DeferredChanges++;
     return;
+  }
+
+  if (ConfidenceLevel < Args->ConfidenceLevel) {
+    Args->RejectedChanges++;
+    return;
+  }
 
   doConversion(Context, Args, &ParentFinder->getStmtToParentStmtMap(),
                LoopVar, ContainerExpr, Finder.getUsages(), FS);
+  Args->AcceptedChanges++;
 }
 
 static StatementMatcher ArrayLHSMatcher =

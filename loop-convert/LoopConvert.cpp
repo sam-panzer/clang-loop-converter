@@ -1,3 +1,26 @@
+//===-- loop-convert/LoopConvert.cpp - C++11 For loop migration -*- C++ -*-===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements a tool that migrates for loops to take advantage of the
+// range-basead syntax new to C++11.
+//
+// Usage:
+// loop-convert <cmake-output-dir> <file1> <file2> ...
+//
+// Where <cmake-output-dir> is a CMake build directory containing a file named
+// compile_commands.json.
+//
+// <file1>... specify the pahs of files in the CMake source tree, with the same
+// requirements as other tools built on LibTooling.
+//
+//===----------------------------------------------------------------------===//
+
 #include "LoopActions.h"
 
 #include "clang/Basic/FileManager.h"
@@ -20,15 +43,39 @@ static cl::list<std::string> SourcePaths(
     cl::desc("<source0> [... <sourceN>]"),
     cl::OneOrMore);
 
+// General options go here:
+static cl::opt<bool> CountOnly(
+    "count-only", cl::desc("Do not apply transformations; only count them."));
+
+static cl::opt<TranslationConfidenceKind> TransformationLevel(
+    cl::desc("Choose safety requirements for transformations:"),
+    cl::values(clEnumValN(TCK_Safe, "A0", "Enable safe transformations"),
+               clEnumValN(TCK_Extra, "A1",
+                         "Enable transformations that might change semantics "
+                         "(default)"),
+               clEnumValN(TCK_Risky, "A2",
+                          "Enable transformations that are likely "
+                          "to change semantics"),
+               clEnumValEnd),
+    cl::init(TCK_Extra));
+
 int main(int argc, const char **argv) {
-  // OwningPtr is one of LLVM’s RAII smart pointers.
+  // Adjust arguments to force compilation in C++11 mode.
+  int NumArgs = argc + 1;
+  const char **Args = new const char *[NumArgs];
+  for (int I = 0; I < argc; ++I)
+    Args[I] = argv[I];
+  Args[NumArgs - 1] = "-std=c++11";
   llvm::OwningPtr<CompilationDatabase> Compilations(
-      FixedCompilationDatabase::loadFromCommandLine(argc, argv));
-  cl::ParseCommandLineOptions(argc, argv);
+      FixedCompilationDatabase::loadFromCommandLine(NumArgs, Args));
+  cl::ParseCommandLineOptions(NumArgs, Args);
   if (!Compilations) {
     std::string ErrorMessage;
-    Compilations.reset(CompilationDatabase::loadFromDirectory(BuildPath,
-                                                              ErrorMessage));
+    Compilations.reset(
+        !BuildPath.empty() ?
+        CompilationDatabase::autoDetectFromDirectory(BuildPath, ErrorMessage) :
+        CompilationDatabase::autoDetectFromSource(SourcePaths[0],
+                                                  ErrorMessage));
     if (!Compilations)
       llvm::report_fatal_error(ErrorMessage);
   }
@@ -46,14 +93,37 @@ int main(int argc, const char **argv) {
   StmtGeneratedVarNameMap GeneratedDecls;
   ReplacedVarsMap ReplacedVars;
   LoopFixerArgs FixerArgs = {&LoopTool.getReplacements(), &GeneratedDecls,
-                             &ReplacedVars};
-  LoopFixer Fixer(&FixerArgs, &ParentFinder);
+                             &ReplacedVars, /*AcceptedChanges=*/0,
+                             /*DeferredChanges=*/0, /*RejectedChanges=*/0,
+                             CountOnly, TransformationLevel};
   MatchFinder Finder;
-  Finder.addMatcher(LoopMatcher, &Fixer);
+  LoopFixer ArrayLoopFixer(&FixerArgs, &ParentFinder);
+  Finder.addMatcher(LoopMatcher, &ArrayLoopFixer);
   if (int result = LoopTool.run(newFrontendActionFactory(&Finder))) {
     llvm::errs() << "Error encountered during translation.\n";
     return result;
   }
 
+  llvm::outs() << "\nFor Loop Conversion:\n\t" << FixerArgs.AcceptedChanges
+               << " converted loop(s)\n\t" << FixerArgs.DeferredChanges
+               << " potentially conflicting change(s) deferred.\n\t"
+               << FixerArgs.RejectedChanges << " change(s) rejected.\n";
+  if (FixerArgs.DeferredChanges > 0)
+     llvm::outs() << "Re-run this tool to attempt applying deferred changes.\n";
+  if (FixerArgs.RejectedChanges > 0)
+     llvm::outs() << "Re-run this tool with a lower required confidence level "
+                     "to apply rejected changes.\n";
+
+  if (FixerArgs.AcceptedChanges > 0) {
+    // Check to see if the changes introduced any new errors.
+    ClangTool EndSyntaxTool(*Compilations, SourcePaths);
+    if (int result = EndSyntaxTool.run(
+        newFrontendActionFactory<clang::SyntaxOnlyAction>())) {
+      llvm::errs() << "Error compiling files after translation.\n";
+      return result;
+    }
+  }
+
+  delete[] Args;
   return 0;
 }

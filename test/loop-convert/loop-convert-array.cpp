@@ -2,14 +2,23 @@
 // RUN: grep -Ev "//\s*[A-Z-]+:" %s > %t.cpp
 // RUN: loop-convert . %t.cpp -- -I %S/Inputs \
 // RUN:         && FileCheck -input-file=%t.cpp %s
+// RUN: grep -Ev "//\s*[A-Z-]+:" %s > %t.cpp
+// RUN: cp %t.cpp %t.base
+// RUN: loop-convert -count-only . %t.cpp -- -I %S/Inputs > %T/out \
+// RUN:         && FileCheck -check-prefix=COUNTONLY -input-file=%T/out %s \
+// RUN:         && diff %t.cpp %t.base
 
+const int N = 6;
+const int NMinusOne = N - 1;
+int arr[N] = {1, 2, 3, 4, 5, 6};
+int (*pArr)[N] = &arr;
 #include "structures.h"
 void f() {
-  const int N = 6;
-  const int NMinusOne = N - 1;
-  int arr[N] = {1, 2, 3, 4, 5, 6};
-  int (*pArr)[N] = &arr;
   int sum = 0;
+  // Update the number of correctly converted loops as this test changes:
+  // COUNTONLY: 14 converted
+  // COUNTONLY-NEXT: 0 potentially conflicting
+  // COUNTONLY-NEXT: 0 change(s) rejected
 
   for (int i = 0; i < N; ++i) {
     sum += arr[i];
@@ -78,13 +87,6 @@ void f() {
   // CHECK-NEXT: printf("Fibonacci number %d has address %p\n", [[VAR]], &[[VAR]]);
   // CHECK-NEXT: sum += [[VAR]] + 2;
 
-  for (int i = 0; i < N; ++i) {
-    sum += (*pArr)[i];
-  }
-  // CHECK: for (auto & [[VAR:[a-z_]+]] : *pArr) {
-  // CHECK-NEXT: sum += [[VAR]];
-  // CHECK-NEXT: }
-
   Val teas[N];
   for (int i = 0; i < N; ++i) {
     teas[i].g();
@@ -93,3 +95,39 @@ void f() {
   // CHECK-NEXT: [[VAR]].g();
   // CHECK-NEXT: }
 }
+
+struct HasArr {
+  int Arr[N];
+  Val ValArr[N];
+  void implicitThis() {
+    for (int i = 0; i < N; ++i) {
+      printf("%d", Arr[i]);
+    }
+    // CHECK: for (auto & [[VAR:[a-z_]+]] : Arr) {
+    // CHECK-NEXT: printf("%d", [[VAR]]);
+    // CHECK-NEXT: }
+
+    for (int i = 0; i < N; ++i) {
+      printf("%d", ValArr[i].x);
+    }
+    // CHECK: for (auto & [[VAR:[a-z_]+]] : ValArr) {
+    // CHECK-NEXT: printf("%d", [[VAR]].x);
+    // CHECK-NEXT: }
+  }
+
+  void explicitThis() {
+    for (int i = 0; i < N; ++i) {
+      printf("%d", this->Arr[i]);
+    }
+    // CHECK: for (auto & [[VAR:[a-z_]+]] : this->Arr) {
+    // CHECK-NEXT: printf("%d", [[VAR]]);
+    // CHECK-NEXT: }
+
+    for (int i = 0; i < N; ++i) {
+      printf("%d", this->ValArr[i].x);
+    }
+    // CHECK: for (auto & [[VAR:[a-z_]+]] : this->ValArr) {
+    // CHECK-NEXT: printf("%d", [[VAR]].x);
+    // CHECK-NEXT: }
+  }
+};
