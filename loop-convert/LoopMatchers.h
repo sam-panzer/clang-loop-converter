@@ -25,11 +25,13 @@ extern const char ConditionBoundName[];
 extern const char ConditionVarName[];
 extern const char IncrementVarName[];
 extern const char InitVarName[];
+extern const char EndExprName[];
 extern const char EndCallName[];
 extern const char EndVarName[];
 
 ast_matchers::StatementMatcher makeArrayLoopMatcher();
 ast_matchers::StatementMatcher makeIteratorLoopMatcher();
+ast_matchers::StatementMatcher makePseudoArrayLoopMatcher();
 } //namespace loop_migrate
 } //namespace clang
 

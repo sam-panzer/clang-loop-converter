@@ -102,6 +102,8 @@ int main(int argc, const char **argv) {
   Finder.addMatcher(makeArrayLoopMatcher(), &ArrayLoopFixer);
   LoopFixer IteratorLoopFixer(&FixerArgs, &ParentFinder, LFK_Iterator);
   Finder.addMatcher(makeIteratorLoopMatcher(), &IteratorLoopFixer);
+  LoopFixer PseudoarrrayLoopFixer(&FixerArgs, &ParentFinder, LFK_PseudoArray);
+  Finder.addMatcher(makePseudoArrayLoopMatcher(), &PseudoarrrayLoopFixer);
   if (int result = LoopTool.run(newFrontendActionFactory(&Finder))) {
     llvm::errs() << "Error encountered during translation.\n";
     return result;

@@ -84,6 +84,11 @@ class dependent{
   const ElemType & operator[](unsigned) const;
   ElemType & at(unsigned);
   const ElemType & at(unsigned) const;
+
+  // Intentionally evil.
+  dependent<ElemType> operator*();
+
+  void foo();
 };
 
 template<typename First, typename Second>

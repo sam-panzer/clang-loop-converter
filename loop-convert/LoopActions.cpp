@@ -37,11 +37,18 @@ class ForLoopIndexUseVisitor
     : public RecursiveASTVisitor<ForLoopIndexUseVisitor> {
  public:
   ForLoopIndexUseVisitor(ASTContext *Context, const VarDecl *IndexVar,
-                    const VarDecl *EndVar, const Expr *ContainerExpr) :
+                    const VarDecl *EndVar, const Expr *ContainerExpr,
+                    bool ContainerNeedsDereference) :
     OnlyUsedAsIndex(true), Context(Context), IndexVar(IndexVar),
-    EndVar(EndVar), AliasDecl(NULL), ContainerExpr(ContainerExpr)  {
-      if (ContainerExpr)
+    EndVar(EndVar), AliasDecl(NULL), ContainerExpr(ContainerExpr),
+    ContainerNeedsDereference(ContainerNeedsDereference) {
+      if (ContainerExpr) {
         addComponent(ContainerExpr);
+        llvm::FoldingSetNodeID ID;
+        const Expr *E = ContainerExpr->IgnoreParenImpCasts();
+        E->Profile(ID, *Context, true);
+        ContainersIndexed.push_back(std::make_pair(E, ID));
+      }
     }
 
   /// Accessor for Usages.
@@ -99,6 +106,7 @@ class ForLoopIndexUseVisitor
   const DeclStmt *AliasDecl;
   // The Expr which refers to the container.
   const Expr *ContainerExpr;
+  bool ContainerNeedsDereference;
   TranslationConfidenceKind ConfidenceLevel;
   llvm::SmallVector<
       std::pair<const Expr *, llvm::FoldingSetNodeID>, 16> DependentExprs;
@@ -209,6 +217,19 @@ static const Expr *digThroughConstructors(const Expr *E) {
   return E;
 }
 
+// If the expression is a dereference or call to operator*(), return the
+// operand. Otherwise, returns NULL.
+static const Expr *getDereferenceOperand(const Expr *E) {
+  if (const UnaryOperator *Uop = dyn_cast<UnaryOperator>(E))
+    return Uop->getOpcode() == UO_Deref ? Uop->getSubExpr() : NULL;
+
+  if (const CXXOperatorCallExpr *OpCall = dyn_cast<CXXOperatorCallExpr>(E))
+    return OpCall->getOperator() == OO_Star && OpCall->getNumArgs() == 1 ?
+        OpCall->getArg(0) : NULL;
+
+  return NULL;
+}
+
 // Returns true when the ContainerResult contains an Expr equivalent to E.
 template<typename ContainerT>
 static bool containsExpr(ASTContext *Context, const ContainerT *Container,
@@ -230,6 +251,28 @@ static bool isIndexInSubscriptExpr(const Expr *IndexExpr,
   const DeclRefExpr *Idx = getDeclRef(IndexExpr);
   return Arr && Idx && Idx->getType()->isIntegerType()
              && areSameVariable(IndexVar, Idx->getDecl());
+}
+
+// Returns true when the index expression is a declaration reference to
+// IndexVar, Obj is the same expression as SourceExpr after all parens and
+// implicit casts are stirpped off.
+static bool isIndexInSubscriptExpr(ASTContext *Context, const Expr *IndexExpr,
+                                   const VarDecl *IndexVar, const Expr *Obj,
+                                   const Expr *SourceExpr, bool PermitDeref) {
+  if (!SourceExpr || !Obj
+      || ! isIndexInSubscriptExpr(IndexExpr, IndexVar, Obj))
+    return false;
+
+  if (areSameExpr(Context, SourceExpr->IgnoreParenImpCasts(),
+                   Obj->IgnoreParenImpCasts()))
+    return true;
+
+  if (const Expr *InnerObj = getDereferenceOperand(Obj->IgnoreParenImpCasts()))
+    if (PermitDeref && areSameExpr(Context, SourceExpr->IgnoreParenImpCasts(),
+                                   InnerObj->IgnoreParenImpCasts()))
+      return true;
+
+  return false;
 }
 
 // Returns true when Opcall is a call a one-parameter operator on IndexVar.
@@ -373,10 +416,25 @@ bool ForLoopIndexUseVisitor::TraverseMemberExpr(MemberExpr *Member) {
 }
 
 // Calls on the iterator object are not permitted, unless done through
-// operator->().
+// operator->(). The one exception is allowing vector::at() for pseudoarrays.
+// We also treat the base object as being an rvalue if the member function is
+// const.
 bool ForLoopIndexUseVisitor::TraverseCXXMemberCallExpr(
     CXXMemberCallExpr *MemberCall) {
   MemberExpr *Member = cast<MemberExpr>(MemberCall->getCallee());
+  // We specifically allow an accessor named "at" to let STL in, though
+  // this is restricted to pseudo-arrays by requiring a single, integer
+  // argument.
+  const IdentifierInfo *Ident = Member->getMemberDecl()->getIdentifier();
+  if (Ident->isStr("at") && MemberCall->getNumArgs() == 1) {
+    if (isIndexInSubscriptExpr(Context, MemberCall->getArg(0), IndexVar,
+                             Member->getBase(), ContainerExpr,
+                             ContainerNeedsDereference)) {
+      Usage U = {MemberCall, /*IsArrow=*/false, SourceRange()};
+      Usages.push_back(U);
+      return true;
+    }
+  }
 
   if (containsExpr(Context, &DependentExprs, Member->getBase()))
     ConfidenceLevel = std::min(ConfidenceLevel, TCK_Risky);
@@ -406,6 +464,18 @@ bool ForLoopIndexUseVisitor::TraverseCXXOperatorCallExpr(
       Usages.push_back(U);
       return true;
     }
+
+  case OO_Subscript:
+    if (OpCall->getNumArgs() != 2)
+      break;
+    if (isIndexInSubscriptExpr(Context, OpCall->getArg(1), IndexVar,
+                             OpCall->getArg(0), ContainerExpr,
+                             ContainerNeedsDereference)) {
+      Usage U = {OpCall, /*IsArrow=*/false, SourceRange()};
+      Usages.push_back(U);
+      return true;
+    }
+    break;
 
   default:
     break;
@@ -618,8 +688,14 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
   if (FixerKind == LFK_Iterator)
     ContainerExpr = findContainer(Context, LoopVar, EndVar, EndCall,
                                   &ContainerNeedsDereference);
+  else if (FixerKind == LFK_PseudoArray) {
+    ContainerExpr = EndCall->getImplicitObjectArgument();
+    ContainerNeedsDereference =
+        cast<MemberExpr>(EndCall->getCallee())->isArrow();
+  }
 
-  ForLoopIndexUseVisitor Finder(Context, LoopVar, EndVar, ContainerExpr);
+  ForLoopIndexUseVisitor Finder(Context, LoopVar, EndVar, ContainerExpr,
+                           ContainerNeedsDereference);
 
   // Either a container or an integral upper bound must exist.
   if (ContainerExpr) {
@@ -633,14 +709,15 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
   if (!Finder.findUsages(FS->getBody()))
     return;
 
+  const ContainerResult &ContainersIndexed = Finder.getContainersIndexed();
+  if (ContainersIndexed.size() != 1)
+    return;
+
   ConfidenceLevel = std::min(ConfidenceLevel, Finder.getConfidenceLevel());
   // We require that a single array/container be indexed into by LoopVar.
   // This check is done by ForLoopIndexUseVisitor for non-array loops, but we may not
   // know which array is being looped over until the end of the traversal.
   if (FixerKind == LFK_Array) {
-    const ContainerResult &ContainersIndexed = Finder.getContainersIndexed();
-    if (ContainersIndexed.size() != 1)
-      return;
 
     ContainerExpr = ContainersIndexed.begin()->first;
     if (!arrayMatchesBoundExpr(Context, ContainerExpr->getType(), BoundExpr))
@@ -690,25 +767,6 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
 
   Args->AcceptedChanges++;
 }
-
-static StatementMatcher ArrayLHSMatcher =
-  expression(ignoringImpCasts(declarationReference(to(
-      variable(hasType(isInteger())).bind(ConditionVarName)))));
-static StatementMatcher ArrayRHSMatcher =
-  expression(hasType(isInteger())).bind(ConditionBoundName);
-
-StatementMatcher LoopMatcher =
-  id(LoopName, forStmt(
-      hasLoopInit(declarationStatement(hasSingleDecl(id(InitVarName, variable(
-          hasInitializer(ignoringImpCasts(integerLiteral(equals(0))))))))),
-      hasCondition(binaryOperator(hasOperatorName("<"),
-                                  hasLHS(ArrayLHSMatcher),
-                                  hasRHS(ArrayRHSMatcher))),
-      hasIncrement(unaryOperator(
-          hasOperatorName("++"),
-          hasUnaryOperand(declarationReference(to(
-              variable(hasType(isInteger())).bind(IncrementVarName))))))));
-
 
 } // namespace loop_migrate
 } // namespace clang

@@ -94,5 +94,51 @@ StatementMatcher makeIteratorLoopMatcher() {
                         variable().bind(IncrementVarName)))))))));
 }
 
+// The matcher used for array-like containers.
+StatementMatcher makePseudoArrayLoopMatcher() {
+  DeclarationMatcher InitDeclMatcher =
+         variable(hasInitializer(ignoringParenImpCasts(
+             integerLiteral(equals(0))))).bind(InitVarName);
+  StatementMatcher SizeCallMatcher =
+      memberCall(argumentCountIs(0), callee(method(hasName("size"))));
+
+  StatementMatcher EndInitMatcher =
+      expression(anyOf(
+          ignoringParenImpCasts(expression(SizeCallMatcher).bind(EndCallName)),
+          explicitCast(hasSourceExpression(ignoringParenImpCasts(
+              expression(SizeCallMatcher).bind(EndCallName))))));
+
+  DeclarationMatcher EndDeclMatcher =
+       variable(hasInitializer(EndInitMatcher)).bind(EndVarName);
+
+  StatementMatcher IntegerComparisonMatcher =
+      expression(ignoringParenImpCasts(declarationReference(to(
+          variable(hasType(isInteger())).bind(ConditionVarName)))));
+
+  StatementMatcher ArrayBoundMatcher =
+      expression(anyOf(
+          ignoringParenImpCasts(declarationReference(to(
+              variable(hasType(isInteger())).bind(EndCallName)))),
+          EndInitMatcher));
+
+  return id(LoopName, forStmt(
+      hasLoopInit(anyOf(
+          declarationStatement(declCountIs(2),
+                               containsDeclaration(0, InitDeclMatcher),
+                               containsDeclaration(1, EndDeclMatcher)),
+          declarationStatement(hasSingleDecl(InitDeclMatcher)))),
+      hasCondition(anyOf(
+          binaryOperator(hasOperatorName("<"),
+                         hasLHS(IntegerComparisonMatcher),
+                         hasRHS(ArrayBoundMatcher)),
+          binaryOperator(hasOperatorName(">"),
+                         hasLHS(ArrayBoundMatcher),
+                         hasRHS(IntegerComparisonMatcher)))),
+      hasIncrement(unaryOperator(
+          hasOperatorName("++"),
+          hasUnaryOperand(declarationReference(to(
+              variable(hasType(isInteger())).bind(IncrementVarName))))))));
+}
+
 } // namespace loop_migrate
 } // namespace clang
