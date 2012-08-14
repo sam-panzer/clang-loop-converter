@@ -29,7 +29,8 @@ class ForLoopIndexUseVisitor
     : public RecursiveASTVisitor<ForLoopIndexUseVisitor> {
  public:
   ForLoopIndexUseVisitor(ASTContext *Context, const VarDecl *IndexVar) :
-    OnlyUsedAsIndex(true), Context(Context), IndexVar(IndexVar) { }
+    OnlyUsedAsIndex(true), Context(Context), IndexVar(IndexVar),
+  AliasDecl(NULL) { }
 
   /// Accessor for Usages.
   const UsageResult &getUsages() const { return Usages; }
@@ -43,6 +44,10 @@ class ForLoopIndexUseVisitor
   TranslationConfidenceKind getConfidenceLevel() const {
     return ConfidenceLevel;
   }
+
+  /// Returns the statement declaring the variable created as an alias for the
+  /// loop element, if any.
+  const DeclStmt *getAliasDecl() const { return AliasDecl; }
 
   // Finds all uses of IndexVar in Body, placing all usages in Usages, all
   // referenced arrays in ContainersIndexed, and returns true if IndexVar was
@@ -66,8 +71,10 @@ class ForLoopIndexUseVisitor
   UsageResult Usages;
   /// A set which holds expressions containing the referenced arrays.
   ContainerResult ContainersIndexed;
-  // The index variable's VarDecl.
+  /// The index variable's VarDecl.
   const VarDecl *IndexVar;
+  // The DeclStmt for an alias to the container element.
+  const DeclStmt *AliasDecl;
   // The Expr which refers to the container.
   TranslationConfidenceKind ConfidenceLevel;
 
@@ -77,6 +84,7 @@ class ForLoopIndexUseVisitor
   // Overriden methods for RecursiveASTVisitor's traversal
   bool TraverseArraySubscriptExpr(ArraySubscriptExpr *ASE);
   bool VisitDeclRefExpr(DeclRefExpr *DRE);
+  bool VisitDeclStmt(DeclStmt *DS);
 };
 
 // Obtain the original source code text from a SourceRange.
@@ -150,6 +158,24 @@ static bool isIndexInSubscriptExpr(const Expr *IndexExpr,
              && areSameVariable(IndexVar, Idx->getDecl());
 }
 
+// Determines whether the given Decl defines an alias to the given variable.
+static bool isAliasDecl(const Decl *TheDecl, const VarDecl *TargetDecl) {
+  const VarDecl *VDecl = dyn_cast<VarDecl>(TheDecl);
+  if (!VDecl)
+    return false;
+
+  if (!VDecl->hasInit())
+    return false;
+  const Expr *Init = VDecl->getInit()->IgnoreImpCasts();
+  if (Init->getStmtClass() == Stmt::ArraySubscriptExprClass) {
+    const ArraySubscriptExpr *ASE = cast<ArraySubscriptExpr>(Init);
+    // We don't really care which array is used here. We check to make sure
+    // it was the correct one later, since the AST will traverse it next.
+    return isIndexInSubscriptExpr(ASE->getIdx(), TargetDecl, ASE->getBase());
+  }
+  return false;
+}
+
 // Determines whether the bound of a for loop condition expression is the same
 // as the statically computable size of ArrayType.
 static bool arrayMatchesBoundExpr(ASTContext *Context,
@@ -192,29 +218,53 @@ bool ForLoopIndexUseVisitor::VisitDeclRefExpr(DeclRefExpr *DRE) {
   return true;
 }
 
+// If we find that another variable is created just to refer to the loop
+// element, we can reuse it as the loop variable.
+bool ForLoopIndexUseVisitor::VisitDeclStmt(DeclStmt *DS) {
+  if (!AliasDecl && DS->isSingleDecl() &&
+      isAliasDecl(DS->getSingleDecl(), IndexVar))
+      AliasDecl = DS;
+  return true;
+}
+
 // Apply the source transformations necessary to migrate the loop!
 static void doConversion(ASTContext *Context, LoopFixerArgs *Args,
                          const StmtParentMap *ParentMap,
                          const VarDecl *IndexVar, const Expr *ContainerExpr,
-                         const UsageResult &Usages, const ForStmt *TheLoop) {
+                         const UsageResult &Usages, const DeclStmt *AliasDecl,
+                         const ForStmt *TheLoop) {
   const VarDecl *MaybeContainer = getReferencedVariable(ContainerExpr);
-  VariableNamer Namer(Context, Args->GeneratedDecls, ParentMap,
-                      IndexVar->getDeclContext(), TheLoop, IndexVar,
-                      MaybeContainer);
-  std::string VarName = Namer.createIndexName();
+  std::string VarName;
 
-  // First, replace all usages of the array subscript expression with our new
-  // variable.
-  for (UsageResult::const_iterator I = Usages.begin(), E = Usages.end();
-       I != E; ++I) {
-    SourceRange ReplaceRange = (*I)->getSourceRange();
-    std::string ReplaceText = VarName;
-    Args->ReplacedVarRanges->insert(std::make_pair(TheLoop, IndexVar));
+  if (Usages.size() == 1 && AliasDecl) {
+    const VarDecl *AliasVar = cast<VarDecl>(AliasDecl->getSingleDecl());
+    VarName = AliasVar->getName().str();
+    // We keep along the entire DeclStmt to keep the correct range here.
+    const SourceRange &ReplaceRange = AliasDecl->getSourceRange();
     if (!Args->CountOnly)
       Args->Replace->insert(
           Replacement(Context->getSourceManager(),
-                      CharSourceRange::getTokenRange(ReplaceRange),
-                      ReplaceText));
+                      CharSourceRange::getTokenRange(ReplaceRange), ""));
+    // No further replacements are made to the loop, since the iterator or index
+    // was used exactly once - in the initialization of AliasVar.
+  } else {
+    VariableNamer Namer(Context, Args->GeneratedDecls, ParentMap,
+                        IndexVar->getDeclContext(), TheLoop, IndexVar,
+                        MaybeContainer);
+    VarName = Namer.createIndexName();
+    // First, replace all usages of the array subscript expression with our new
+    // variable.
+    for (UsageResult::const_iterator I = Usages.begin(), E = Usages.end();
+         I != E; ++I) {
+      SourceRange ReplaceRange = (*I)->getSourceRange();
+      std::string ReplaceText = VarName;
+      Args->ReplacedVarRanges->insert(std::make_pair(TheLoop, IndexVar));
+      if (!Args->CountOnly)
+        Args->Replace->insert(
+            Replacement(Context->getSourceManager(),
+                        CharSourceRange::getTokenRange(ReplaceRange),
+                        ReplaceText));
+    }
   }
 
   // Now, we need to construct the new range expresion.
@@ -308,7 +358,9 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
   }
 
   doConversion(Context, Args, &ParentFinder->getStmtToParentStmtMap(),
-               LoopVar, ContainerExpr, Finder.getUsages(), FS);
+               LoopVar, ContainerExpr, Finder.getUsages(),
+               Finder.getAliasDecl(), FS);
+
   Args->AcceptedChanges++;
 }
 
