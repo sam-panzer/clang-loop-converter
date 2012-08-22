@@ -37,7 +37,8 @@ enum TranslationConfidenceKind {
 enum LoopFixerKind {
   LFK_Array,
   LFK_Iterator,
-  LFK_PseudoArray
+  LFK_PseudoArray,
+  LFK_Protobuf
 };
 
 /// \brief The callback to be used for loop migration matchers.
@@ -77,7 +78,9 @@ class LoopFixer : public ast_matchers::MatchFinder::MatchCallback {
   /// applies it if this->CountOnly is false.
   void doConversion(ASTContext *Context,
                     const VarDecl *IndexVar,
-                    const Expr *ContainerExpr, const UsageResult &Usages,
+                    const VarDecl *MaybeContainer,
+                    const std::string &ContainerString,
+                    const UsageResult &Usages,
                     const DeclStmt *AliasDecl, const ForStmt *TheLoop,
                     bool ContainerNeedsDereference);
 
@@ -90,7 +93,8 @@ class LoopFixer : public ast_matchers::MatchFinder::MatchCallback {
                            const Expr *BoundExpr,
                            bool ContainerNeedsDereference,
                            const ForStmt *TheLoop,
-                           Confidence ConfidenceLevel);
+                           Confidence ConfidenceLevel,
+                           std::string ProtoName);
 };
 
 } // namespace loop_migrate

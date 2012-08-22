@@ -212,5 +212,75 @@ StatementMatcher makePseudoArrayLoopMatcher() {
       .bind(LoopName);
 }
 
+/// \brief The matcher used for protocol buffers (protobufs).
+///
+/// This matcher is very similar to pseudoarrays.
+/// loops of the following textual forms (regardless of whether the
+/// iterator type is actually a pointer type or a class type):
+///
+/// Assuming f, g, and h are of type containerType::iterator,
+///   for (int i = 0, j = container.foo_size(); f < g; ++h) { ... }
+///   for (int i = 0; f < container.foo_size(); ++h) { ... }
+/// The following string identifiers are bound to the parts of the AST:
+///   InitVarName: 'i' (as a VarDecl)
+///   ConditionVarName: 'f' (as a VarDecl)
+///   LoopName: The entire for loop (as a ForStmt)
+///   In the first example only:
+///     EndVarName: 'j' (as a VarDecl)
+///     ConditionEndVarName: 'g' (as a VarDecl)
+///   In the second example only:
+///     EndCallName: 'container.size()' (as a CXXMemberCallExpr)
+///
+/// Client code will need to make sure that:
+///   - The index variables 'i', 'f', and 'h' are the same
+///   - The containers on which 'size()' is called is the container indexed
+///   - The index variable is only used in container.foo()
+///   - If the end iterator variable 'g' is defined, it is the same as 'j'
+///   - The container's iterators would not be invalidated during the loop
+StatementMatcher makeProtobufLoopMatcher() {
+  DeclarationMatcher InitDeclMatcher =
+         variable(hasInitializer(ignoringParenImpCasts(
+             integerLiteral(equals(0))))).bind(InitVarName);
+  StatementMatcher SizeCallMatcher =
+      memberCall(argumentCountIs(0), callee(method(matchesName(".*size$"))));
+
+  StatementMatcher EndInitMatcher =
+      expression(anyOf(
+          ignoringParenImpCasts(expression(SizeCallMatcher).bind(EndCallName)),
+          explicitCast(hasSourceExpression(ignoringParenImpCasts(
+              expression(SizeCallMatcher).bind(EndCallName))))));
+
+  DeclarationMatcher EndDeclMatcher =
+       variable(hasInitializer(EndInitMatcher)).bind(EndVarName);
+
+  StatementMatcher IntegerComparisonMatcher =
+      expression(ignoringParenImpCasts(declarationReference(to(
+          variable(hasType(isInteger())).bind(ConditionVarName)))));
+
+  StatementMatcher ArrayBoundMatcher =
+      expression(anyOf(
+          ignoringParenImpCasts(declarationReference(to(
+              variable(hasType(isInteger())).bind(ConditionEndVarName)))),
+          EndInitMatcher));
+
+  return id(LoopName, forStmt(
+      hasLoopInit(anyOf(
+          declarationStatement(declCountIs(2),
+                               containsDeclaration(0, InitDeclMatcher),
+                               containsDeclaration(1, EndDeclMatcher)),
+          declarationStatement(hasSingleDecl(InitDeclMatcher)))),
+      hasCondition(anyOf(
+          binaryOperator(hasOperatorName("<"),
+                         hasLHS(IntegerComparisonMatcher),
+                         hasRHS(ArrayBoundMatcher)),
+          binaryOperator(hasOperatorName(">"),
+                         hasLHS(ArrayBoundMatcher),
+                         hasRHS(IntegerComparisonMatcher)))),
+      hasIncrement(unaryOperator(
+          hasOperatorName("++"),
+          hasUnaryOperand(declarationReference(to(
+              variable(hasType(isInteger())).bind(IncrementVarName))))))));
+}
+
 } // namespace loop_migrate
 } // namespace clang

@@ -57,11 +57,13 @@ class ForLoopIndexUseVisitor
   ForLoopIndexUseVisitor(ASTContext *Context, const VarDecl *IndexVar,
                          const VarDecl *EndVar, const Expr *ContainerExpr,
                          const Expr *ArrayBoundExpr,
-                         bool ContainerNeedsDereference) :
+                         bool ContainerNeedsDereference,
+                         std::string ProtoName) :
     Context(Context), IndexVar(IndexVar), EndVar(EndVar),
     ContainerExpr(ContainerExpr), ArrayBoundExpr(ArrayBoundExpr),
-    ContainerNeedsDereference(ContainerNeedsDereference),
-    OnlyUsedAsIndex(true),  AliasDecl(NULL), ConfidenceLevel(TCK_Safe) {
+    ContainerNeedsDereference(ContainerNeedsDereference), ProtoName(ProtoName),
+    OnlyUsedAsIndex(true), IsRValue(false), AliasDecl(NULL),
+    ConfidenceLevel(TCK_Safe) {
      if (ContainerExpr) {
        addComponent(ContainerExpr);
        llvm::FoldingSetNodeID ID;
@@ -121,6 +123,7 @@ class ForLoopIndexUseVisitor
   bool TraverseArraySubscriptExpr(ArraySubscriptExpr *ASE);
   bool TraverseCXXMemberCallExpr(CXXMemberCallExpr *MemberCall);
   bool TraverseCXXOperatorCallExpr(CXXOperatorCallExpr *OpCall);
+  bool TraverseImplicitCastExpr(ImplicitCastExpr *ICE);
   bool TraverseMemberExpr(MemberExpr *Member);
   bool TraverseUnaryDeref(UnaryOperator *Uop);
   bool VisitDeclRefExpr(DeclRefExpr *DRE);
@@ -146,12 +149,15 @@ class ForLoopIndexUseVisitor
   /// The Expr which refers to the terminating condition for array-based loops.
   const Expr *ArrayBoundExpr;
   bool ContainerNeedsDereference;
+  std::string ProtoName;
 
   // Output member variables:
   /// A container which holds all usages of IndexVar as the index of
   /// ArraySubscriptExpressions.
   UsageResult Usages;
   bool OnlyUsedAsIndex;
+  /// Tracks whether the visitor is currently in an RValue context.
+  bool IsRValue;
   /// The DeclStmt for an alias to the container element.
   const DeclStmt *AliasDecl;
   Confidence ConfidenceLevel;
@@ -434,6 +440,16 @@ static bool arrayMatchesBoundExpr(ASTContext *Context,
   return false;
 }
 
+// When we encounter an LValueToRValue implicit cast, immediate sub-nodes are
+// considered used as an rvalue.
+bool ForLoopIndexUseVisitor::TraverseImplicitCastExpr(ImplicitCastExpr *ICE) {
+  if (ICE->getCastKind() == CK_LValueToRValue)
+    IsRValue = true;
+  else if (ICE->getCastKind() != CK_NoOp)
+    IsRValue = false;
+  return VisitorBase::TraverseImplicitCastExpr(ICE);
+}
+
 /// \brief If the unary operator is a dereference of IndexVar, include it
 /// as a valid usage and prune the traversal.
 ///
@@ -451,6 +467,7 @@ bool ForLoopIndexUseVisitor::TraverseUnaryDeref(UnaryOperator *Uop) {
     return true;
   }
 
+  IsRValue = false;
   return VisitorBase::TraverseUnaryOperator(Uop);
 }
 
@@ -515,6 +532,8 @@ bool ForLoopIndexUseVisitor::TraverseMemberExpr(MemberExpr *Member) {
       return true;
     }
   }
+  // MemberExpr's don't change the L- or R-value status.
+  // FIXME: do they?
   return TraverseStmt(Member->getBase());
 }
 
@@ -524,15 +543,17 @@ bool ForLoopIndexUseVisitor::TraverseMemberExpr(MemberExpr *Member) {
 ///
 /// Member calls on other objects will not be permitted.
 /// Calls on the iterator object are not permitted, unless done through
-/// operator->(). The one exception is allowing vector::at() for pseudoarrays.
+/// operator->(). The exceptions are allowing vector::at() for pseudoarrays.
 bool ForLoopIndexUseVisitor::TraverseCXXMemberCallExpr(
     CXXMemberCallExpr *MemberCall) {
   MemberExpr *Member = cast<MemberExpr>(MemberCall->getCallee());
   // We specifically allow an accessor named "at" to let STL in, though
   // this is restricted to pseudo-arrays by requiring a single, integer
   // argument.
+  // Additionally, the name of a protobuf is permitted much like "at".
   const IdentifierInfo *Ident = Member->getMemberDecl()->getIdentifier();
-  if (Ident && Ident->isStr("at") && MemberCall->getNumArgs() == 1) {
+  if (Ident && MemberCall->getNumArgs() == 1 &&
+      (Ident->isStr("at") || Ident->getName() == ProtoName)) {
     if (isIndexInSubscriptExpr(Context, MemberCall->getArg(0), IndexVar,
                                Member->getBase(), ContainerExpr,
                                ContainerNeedsDereference)) {
@@ -541,10 +562,15 @@ bool ForLoopIndexUseVisitor::TraverseCXXMemberCallExpr(
     }
   }
 
-  if (containsExpr(Context, &DependentExprs, Member->getBase()))
+  IsRValue = MemberCall->getMethodDecl()->isConst();
+  if (containsExpr(Context, &DependentExprs, Member->getBase()) && !IsRValue)
     ConfidenceLevel.lowerTo(TCK_Risky);
 
-  return VisitorBase::TraverseCXXMemberCallExpr(MemberCall);
+  bool BaseResult = TraverseMemberExpr(Member);
+  IsRValue = false;
+  for (unsigned I = 0; I < MemberCall->getNumArgs(); ++I)
+    BaseResult = BaseResult && TraverseStmt(MemberCall->getArg(I));
+  return BaseResult;
 }
 
 /// \brief If an overloaded operator call is a dereference of IndexVar or
@@ -586,6 +612,7 @@ bool ForLoopIndexUseVisitor::TraverseCXXOperatorCallExpr(
   default:
     break;
   }
+  IsRValue = false;
   return VisitorBase::TraverseCXXOperatorCallExpr(OpCall);
 }
 
@@ -605,8 +632,10 @@ bool ForLoopIndexUseVisitor::TraverseCXXOperatorCallExpr(
 bool ForLoopIndexUseVisitor::TraverseArraySubscriptExpr(
     ArraySubscriptExpr *ASE) {
   Expr *Arr = ASE->getBase();
-  if (!isIndexInSubscriptExpr(ASE->getIdx(), IndexVar))
+  if (!isIndexInSubscriptExpr(ASE->getIdx(), IndexVar)) {
+    IsRValue = false;
     return VisitorBase::TraverseArraySubscriptExpr(ASE);
+  }
 
   if ((ContainerExpr && !areSameExpr(Context, Arr->IgnoreParenImpCasts(),
                                      ContainerExpr->IgnoreParenImpCasts()))
@@ -617,7 +646,6 @@ bool ForLoopIndexUseVisitor::TraverseArraySubscriptExpr(
     OnlyUsedAsIndex = false;
     return VisitorBase::TraverseArraySubscriptExpr(ASE);
   }
-
   if (!ContainerExpr)
     ContainerExpr = Arr;
 
@@ -660,7 +688,7 @@ bool ForLoopIndexUseVisitor::VisitDeclRefExpr(DeclRefExpr *DRE) {
   const ValueDecl *TheDecl = DRE->getDecl();
   if (areSameVariable(IndexVar, TheDecl) || areSameVariable(EndVar, TheDecl))
     OnlyUsedAsIndex = false;
-  if (containsExpr(Context, &DependentExprs, DRE))
+  if (containsExpr(Context, &DependentExprs, DRE) && !IsRValue)
     ConfidenceLevel.lowerTo(TCK_Risky);
   return true;
 }
@@ -679,12 +707,11 @@ bool ForLoopIndexUseVisitor::VisitDeclStmt(DeclStmt *DS) {
 //// \brief Apply the source transformations necessary to migrate the loop!
 void LoopFixer::doConversion(ASTContext *Context,
                              const VarDecl *IndexVar,
-                             const Expr *ContainerExpr,
+                             const VarDecl *MaybeContainer,
+                             const std::string &ContainerString,
                              const UsageResult &Usages,
-                             const DeclStmt *AliasDecl,
-                             const ForStmt *TheLoop,
+                             const DeclStmt *AliasDecl, const ForStmt *TheLoop,
                              bool ContainerNeedsDereference) {
-  const VarDecl *MaybeContainer = getReferencedVariable(ContainerExpr);
   std::string VarName;
 
   if (Usages.size() == 1 && AliasDecl) {
@@ -718,17 +745,15 @@ void LoopFixer::doConversion(ASTContext *Context,
 
   // Now, we need to construct the new range expresion.
   SourceRange ParenRange(TheLoop->getLParenLoc(), TheLoop->getRParenLoc());
-  StringRef ContainerString =
-      getStringFromRange(Context->getSourceManager(), Context->getLangOpts(),
-                         ContainerExpr->getSourceRange());
+  // FIXME: Handle the case where this getStringFromRange is empty.
 
   QualType AutoRefType =
       Context->getLValueReferenceType(Context->getAutoDeductType());
 
   std::string MaybeDereference = ContainerNeedsDereference ? "*" : "";
   std::string TypeString = AutoRefType.getAsString();
-  std::string Range = ("(" + TypeString + " " + VarName + " : "
-                           + MaybeDereference + ContainerString + ")").str();
+  std::string Range = "(" + TypeString + " " + VarName + " : "
+                          + MaybeDereference + ContainerString + ")";
   if (!CountOnly)
     Replace->insert(Replacement(Context->getSourceManager(),
                                 CharSourceRange::getTokenRange(ParenRange),
@@ -802,9 +827,11 @@ void LoopFixer::FindAndVerifyUsages(ASTContext *Context,
                                     const Expr *BoundExpr,
                                     bool ContainerNeedsDereference,
                                     const ForStmt *TheLoop,
-                                    Confidence ConfidenceLevel) {
+                                    Confidence ConfidenceLevel,
+                                    std::string ProtoName) {
   ForLoopIndexUseVisitor Finder(Context, LoopVar, EndVar, ContainerExpr,
-                                BoundExpr, ContainerNeedsDereference);
+                                BoundExpr, ContainerNeedsDereference,
+                                ProtoName);
   if (ContainerExpr) {
     ComponentFinderASTVisitor ComponentFinder;
     ComponentFinder.findExprComponents(ContainerExpr->IgnoreParenImpCasts());
@@ -855,7 +882,17 @@ void LoopFixer::FindAndVerifyUsages(ASTContext *Context,
     return;
   }
 
-  doConversion(Context, LoopVar, ContainerExpr, Finder.getUsages(),
+  Twine ContainerString =
+      getStringFromRange(Context->getSourceManager(), Context->getLangOpts(),
+                         ContainerExpr->getSourceRange());
+  // In case someone is using an evil macro, reject this change.
+  if (ContainerString.isTriviallyEmpty())
+    ++*RejectedChanges;
+
+  if (FixerKind == LFK_Protobuf)
+    ContainerString = ContainerString + "." + ProtoName + "()";
+  doConversion(Context, LoopVar, getReferencedVariable(ContainerExpr),
+               ContainerString.str(), Finder.getUsages(),
                Finder.getAliasDecl(), TheLoop, ContainerNeedsDereference);
   ++*AcceptedChanges;
 }
@@ -906,17 +943,32 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
     ContainerExpr = findContainer(Context, LoopVar->getInit(),
                                   EndVar ? EndVar->getInit() : EndCall,
                                   &ContainerNeedsDereference);
-  else if (FixerKind == LFK_PseudoArray) {
+  else if (FixerKind == LFK_PseudoArray || FixerKind == LFK_Protobuf) {
     ContainerExpr = EndCall->getImplicitObjectArgument();
     ContainerNeedsDereference =
         cast<MemberExpr>(EndCall->getCallee())->isArrow();
   }
-  // We must know the container being iterated over by now for non-array loops.
-  if (!ContainerExpr && FixerKind != LFK_Array)
+
+  std::string ProtoName;
+  if (FixerKind == LFK_Protobuf) {
+    const char Suffix[] = "_size";
+    const std::string SizeCallName =
+        EndCall->getMethodDecl()->getNameAsString();
+    // The name of the protobuf can't be empty after removing "_size" from the
+    // end.
+    if (SizeCallName.length() <= strlen(Suffix))
+      return;
+    ProtoName = SizeCallName.substr(0, SizeCallName.length() - strlen(Suffix));
+  }
+
+  // We must know the container being iterated over by now for non-array,
+  // non-protobuf loops.
+  if (!ContainerExpr && FixerKind != LFK_Array && FixerKind != LFK_Protobuf)
     return;
 
   FindAndVerifyUsages(Context, LoopVar, EndVar, ContainerExpr, BoundExpr,
-                      ContainerNeedsDereference, TheLoop, ConfidenceLevel);
+                      ContainerNeedsDereference, TheLoop, ConfidenceLevel,
+                      ProtoName);
 }
 
 } // namespace loop_migrate
