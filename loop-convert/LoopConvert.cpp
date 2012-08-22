@@ -108,6 +108,13 @@ int main(int argc, const char **argv) {
                                   &RejectedChanges, CountOnly,
                                   TransformationLevel, LFK_PseudoArray);
   Finder.addMatcher(makePseudoArrayLoopMatcher(), &PseudoarrrayLoopFixer);
+
+  LoopFixer ProtobufLoopFixer(&ParentFinder, &LoopTool.getReplacements(),
+                                  &GeneratedDecls, &ReplacedVars,
+                                  &AcceptedChanges, &DeferredChanges,
+                                  &RejectedChanges, CountOnly,
+                                  TransformationLevel, LFK_Protobuf);
+  Finder.addMatcher(makeProtobufLoopMatcher(), &ProtobufLoopFixer);
   if (int result = LoopTool.run(newFrontendActionFactory(&Finder))) {
     llvm::errs() << "Error encountered during translation.\n";
     return result;
