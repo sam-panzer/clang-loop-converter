@@ -28,6 +28,25 @@ static const StatementMatcher IncrementVarMatcher =
     declarationReference(to(
         variable(hasType(isInteger())).bind(IncrementVarName)));
 
+StatementMatcher EndInitMatcher(StatementMatcher SizeCallMatcher) {
+    return expression(anyOf(
+        ignoringParenImpCasts(expression(SizeCallMatcher).bind(EndCallName)),
+        explicitCast(hasSourceExpression(ignoringParenImpCasts(
+            expression(SizeCallMatcher).bind(EndCallName))))));
+}
+
+DeclarationMatcher EndDeclMatcher(StatementMatcher SizeCallMatcher) {
+  return variable(hasInitializer(EndInitMatcher(SizeCallMatcher)))
+      .bind(EndVarName);
+}
+
+StatementMatcher IndexBoundMatcher(StatementMatcher SizeCallMatcher) {
+  return expression(anyOf(
+      ignoringParenImpCasts(declarationReference(to(
+          variable(hasType(isInteger())).bind(ConditionEndVarName)))),
+      EndInitMatcher(SizeCallMatcher)));
+}
+
 // FIXME: How best to document complicated matcher expressions? They're fairly
 // self-documenting...but there may be some unintuitive parts.
 
@@ -93,14 +112,15 @@ StatementMatcher makeIteratorLoopMatcher() {
   StatementMatcher BeginCallMatcher =
       memberCall(argumentCountIs(0), callee(method(hasName("begin"))));
 
+  StatementMatcher EndCallMatcher =
+      memberCall(argumentCountIs(0), callee(method(hasName("end"))));
+
   DeclarationMatcher InitDeclMatcher =
       variable(hasInitializer(anything())).bind(InitVarName);
 
-  DeclarationMatcher EndDeclMatcher =
+  DeclarationMatcher IteratorEndDeclMatcher =
       variable(hasInitializer(anything())).bind(EndVarName);
 
-  StatementMatcher EndCallMatcher =
-      memberCall(argumentCountIs(0), callee(method(hasName("end"))));
 
   StatementMatcher IteratorBoundMatcher =
       expression(anyOf(ignoringParenImpCasts(declarationReference(to(
@@ -125,7 +145,7 @@ StatementMatcher makeIteratorLoopMatcher() {
       hasLoopInit(anyOf(
           declarationStatement(declCountIs(2),
                                containsDeclaration(0, InitDeclMatcher),
-                               containsDeclaration(1, EndDeclMatcher)),
+                               containsDeclaration(1, IteratorEndDeclMatcher)),
           declarationStatement(hasSingleDecl(InitDeclMatcher)))),
       hasCondition(anyOf(
           binaryOperator(hasOperatorName("!="),
@@ -178,33 +198,19 @@ StatementMatcher makePseudoArrayLoopMatcher() {
       memberCall(argumentCountIs(0), callee(method(anyOf(hasName("size"),
                                                          hasName("length")))));
 
-  StatementMatcher EndInitMatcher =
-      expression(anyOf(
-          ignoringParenImpCasts(expression(SizeCallMatcher).bind(EndCallName)),
-          explicitCast(hasSourceExpression(ignoringParenImpCasts(
-              expression(SizeCallMatcher).bind(EndCallName))))));
-
-  DeclarationMatcher EndDeclMatcher =
-       variable(hasInitializer(EndInitMatcher)).bind(EndVarName);
-
-  StatementMatcher IndexBoundMatcher =
-      expression(anyOf(
-          ignoringParenImpCasts(declarationReference(to(
-              variable(hasType(isInteger())).bind(ConditionEndVarName)))),
-          EndInitMatcher));
-
   return forStmt(
       hasLoopInit(anyOf(
           declarationStatement(declCountIs(2),
                                containsDeclaration(0, InitToZeroMatcher),
-                               containsDeclaration(1, EndDeclMatcher)),
+                               containsDeclaration(1, EndDeclMatcher(
+                                   SizeCallMatcher))),
           declarationStatement(hasSingleDecl(InitToZeroMatcher)))),
       hasCondition(anyOf(
           binaryOperator(hasOperatorName("<"),
                          hasLHS(IntegerComparisonMatcher),
-                         hasRHS(IndexBoundMatcher)),
+                         hasRHS(IndexBoundMatcher(SizeCallMatcher))),
           binaryOperator(hasOperatorName(">"),
-                         hasLHS(IndexBoundMatcher),
+                         hasLHS(IndexBoundMatcher(SizeCallMatcher)),
                          hasRHS(IntegerComparisonMatcher)))),
       hasIncrement(unaryOperator(
           hasOperatorName("++"),
@@ -238,43 +244,22 @@ StatementMatcher makePseudoArrayLoopMatcher() {
 ///   - If the end iterator variable 'g' is defined, it is the same as 'j'
 ///   - The container's iterators would not be invalidated during the loop
 StatementMatcher makeProtobufLoopMatcher() {
-  DeclarationMatcher InitDeclMatcher =
-         variable(hasInitializer(ignoringParenImpCasts(
-             integerLiteral(equals(0))))).bind(InitVarName);
   StatementMatcher SizeCallMatcher =
       memberCall(argumentCountIs(0), callee(method(matchesName(".*size$"))));
-
-  StatementMatcher EndInitMatcher =
-      expression(anyOf(
-          ignoringParenImpCasts(expression(SizeCallMatcher).bind(EndCallName)),
-          explicitCast(hasSourceExpression(ignoringParenImpCasts(
-              expression(SizeCallMatcher).bind(EndCallName))))));
-
-  DeclarationMatcher EndDeclMatcher =
-       variable(hasInitializer(EndInitMatcher)).bind(EndVarName);
-
-  StatementMatcher IntegerComparisonMatcher =
-      expression(ignoringParenImpCasts(declarationReference(to(
-          variable(hasType(isInteger())).bind(ConditionVarName)))));
-
-  StatementMatcher ArrayBoundMatcher =
-      expression(anyOf(
-          ignoringParenImpCasts(declarationReference(to(
-              variable(hasType(isInteger())).bind(ConditionEndVarName)))),
-          EndInitMatcher));
 
   return id(LoopName, forStmt(
       hasLoopInit(anyOf(
           declarationStatement(declCountIs(2),
-                               containsDeclaration(0, InitDeclMatcher),
-                               containsDeclaration(1, EndDeclMatcher)),
-          declarationStatement(hasSingleDecl(InitDeclMatcher)))),
+                               containsDeclaration(0, InitToZeroMatcher),
+                               containsDeclaration(1, EndDeclMatcher(
+                                   SizeCallMatcher))),
+          declarationStatement(hasSingleDecl(InitToZeroMatcher)))),
       hasCondition(anyOf(
           binaryOperator(hasOperatorName("<"),
                          hasLHS(IntegerComparisonMatcher),
-                         hasRHS(ArrayBoundMatcher)),
+                         hasRHS(IndexBoundMatcher(SizeCallMatcher))),
           binaryOperator(hasOperatorName(">"),
-                         hasLHS(ArrayBoundMatcher),
+                         hasLHS(IndexBoundMatcher(SizeCallMatcher)),
                          hasRHS(IntegerComparisonMatcher)))),
       hasIncrement(unaryOperator(
           hasOperatorName("++"),

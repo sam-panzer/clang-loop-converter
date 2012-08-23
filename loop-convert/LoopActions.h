@@ -95,6 +95,14 @@ class LoopFixer : public ast_matchers::MatchFinder::MatchCallback {
                            const ForStmt *TheLoop,
                            Confidence ConfidenceLevel,
                            std::string ProtoName);
+
+  /// \brief Determine if the change should be deferred or rejected, returning
+  /// text which refers to the container iterated over if the change should
+  /// proceed.
+  StringRef CheckDeferAndRejection(ASTContext *Context,
+                                   const Expr *ContainerExpr,
+                                   Confidence ConfidenceLevel,
+                                   const ForStmt *TheLoop);
 };
 
 } // namespace loop_migrate

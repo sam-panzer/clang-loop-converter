@@ -745,7 +745,6 @@ void LoopFixer::doConversion(ASTContext *Context,
 
   // Now, we need to construct the new range expresion.
   SourceRange ParenRange(TheLoop->getLParenLoc(), TheLoop->getRParenLoc());
-  // FIXME: Handle the case where this getStringFromRange is empty.
 
   QualType AutoRefType =
       Context->getLValueReferenceType(Context->getAutoDeductType());
@@ -817,6 +816,49 @@ static const Expr *findContainer(ASTContext *Context, const Expr *BeginExpr,
   return BeginContainerExpr;
 }
 
+
+StringRef LoopFixer::CheckDeferAndRejection(ASTContext *Context,
+                                            const Expr *ContainerExpr,
+                                            Confidence ConfidenceLevel,
+                                            const ForStmt *TheLoop) {
+  // If we already modified the range of this for loop, don't do any further
+  // updates on this iteration.
+  // FIXME: Once Replacements can detect conflicting edits, replace this
+  // implementation and rely on conflicting edit detection instead.
+  if (ReplacedVarRanges->count(TheLoop)) {
+    ++*DeferredChanges;
+    return "";
+  }
+
+  ParentFinder->gatherAncestors(Context->getTranslationUnitDecl());
+  // Ensure that we do not try to move an expression dependent on a local
+  // variable declared inside the loop outside of it!
+  DependencyFinderASTVisitor
+      DependencyFinder(&ParentFinder->getStmtToParentStmtMap(),
+                       &ParentFinder->getDeclToParentStmtMap(),
+                       ReplacedVarRanges, TheLoop);
+
+  // Not all of these are actually deferred changes.
+  // FIXME: Determine when the external dependency isn't an expression converted
+  // by another loop.
+  if (DependencyFinder.dependsOnOutsideVariable(ContainerExpr)) {
+    ++*DeferredChanges;
+    return "";
+  }
+  if (ConfidenceLevel.get() < RequiredConfidenceLevel) {
+    ++*RejectedChanges;
+    return "";
+  }
+
+  StringRef ContainerString =
+      getStringFromRange(Context->getSourceManager(), Context->getLangOpts(),
+                         ContainerExpr->getSourceRange());
+  // In case someone is using an evil macro, reject this change.
+  if (ContainerString.empty())
+    ++*RejectedChanges;
+  return ContainerString;
+}
+
 /// \brief Given that we have verified that the loop's header appears to be
 /// convertible, run the complete analysis on the loop to determine if the
 /// loop's body is convertible.
@@ -853,48 +895,34 @@ void LoopFixer::FindAndVerifyUsages(ASTContext *Context,
       ConfidenceLevel.lowerTo(TCK_Risky);
   }
 
-  // If we already modified the range of this for loop, don't do any further
-  // updates on this iteration.
-  // FIXME: Once Replacements can detect conflicting edits, replace this
-  // implementation and rely on conflicting edit detection instead.
-  if (ReplacedVarRanges->count(TheLoop)) {
-    ++*DeferredChanges;
+  std::string ContainerString =
+      CheckDeferAndRejection(Context, ContainerExpr, ConfidenceLevel, TheLoop);
+  if (ContainerString.empty())
     return;
-  }
-
-  ParentFinder->gatherAncestors(Context->getTranslationUnitDecl());
-  // Ensure that we do not try to move an expression dependent on a local
-  // variable declared inside the loop outside of it!
-  DependencyFinderASTVisitor
-      DependencyFinder(&ParentFinder->getStmtToParentStmtMap(),
-                       &ParentFinder->getDeclToParentStmtMap(),
-                       ReplacedVarRanges, TheLoop);
-
-  // Not all of these are actually deferred changes.
-  // FIXME: Determine when the external dependency isn't an expression converted
-  // by another loop.
-  if (DependencyFinder.dependsOnOutsideVariable(ContainerExpr)) {
-    ++*DeferredChanges;
-    return;
-  }
-  if (ConfidenceLevel.get() < RequiredConfidenceLevel) {
-    ++*RejectedChanges;
-    return;
-  }
-
-  Twine ContainerString =
-      getStringFromRange(Context->getSourceManager(), Context->getLangOpts(),
-                         ContainerExpr->getSourceRange());
-  // In case someone is using an evil macro, reject this change.
-  if (ContainerString.isTriviallyEmpty())
-    ++*RejectedChanges;
 
   if (FixerKind == LFK_Protobuf)
-    ContainerString = ContainerString + "." + ProtoName + "()";
+    ContainerString += "." + ProtoName + "()";
   doConversion(Context, LoopVar, getReferencedVariable(ContainerExpr),
-               ContainerString.str(), Finder.getUsages(),
+               ContainerString, Finder.getUsages(),
                Finder.getAliasDecl(), TheLoop, ContainerNeedsDereference);
   ++*AcceptedChanges;
+}
+
+/// \brief Given a CXXMemberCallExpr, find and return the name of the protocol
+/// buffer on which the method is being called, if any.
+///
+/// Returns the empty string if no protocol bufer is found.
+std::string getProtobufName(const CXXMemberCallExpr *EndCall) {
+  if (!EndCall)
+    return "";
+  const char Suffix[] = "_size";
+  const std::string SizeCallName =
+      EndCall->getMethodDecl()->getNameAsString();
+  // The name of the protobuf can't be empty after removing "_size" from the
+  // end.
+  if (SizeCallName.length() <= strlen(Suffix))
+    return "" ;
+  return SizeCallName.substr(0, SizeCallName.length() - strlen(Suffix));
 }
 
 /// \brief The LoopFixer callback, which determines if loops discovered by the
@@ -949,17 +977,9 @@ void LoopFixer::run(const MatchFinder::MatchResult &Result) {
         cast<MemberExpr>(EndCall->getCallee())->isArrow();
   }
 
-  std::string ProtoName;
-  if (FixerKind == LFK_Protobuf) {
-    const char Suffix[] = "_size";
-    const std::string SizeCallName =
-        EndCall->getMethodDecl()->getNameAsString();
-    // The name of the protobuf can't be empty after removing "_size" from the
-    // end.
-    if (SizeCallName.length() <= strlen(Suffix))
-      return;
-    ProtoName = SizeCallName.substr(0, SizeCallName.length() - strlen(Suffix));
-  }
+  std::string ProtoName = getProtobufName(EndCall);
+  if (FixerKind == LFK_Protobuf && ProtoName.empty())
+    return;
 
   // We must know the container being iterated over by now for non-array,
   // non-protobuf loops.
