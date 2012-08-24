@@ -14,8 +14,8 @@
 // convertible in the matcher callback.
 //
 //===----------------------------------------------------------------------===//
-#ifndef _LLVM_TOOLS_CLANG_TOOLS_LOOP_CONVERT_LOOP_MATCHERS_H_
-#define _LLVM_TOOLS_CLANG_TOOLS_LOOP_CONVERT_LOOP_MATCHERS_H_
+#ifndef _LLVM_TOOLS_CLANG_TOOLS_EXTRA_LOOP_CONVERT_LOOP_MATCHERS_H_
+#define _LLVM_TOOLS_CLANG_TOOLS_EXTRA_LOOP_CONVERT_LOOP_MATCHERS_H_
 
 #include "clang/ASTMatchers/ASTMatchers.h"
 
@@ -36,7 +36,8 @@ extern const char EndVarName[];
 ast_matchers::StatementMatcher makeArrayLoopMatcher();
 ast_matchers::StatementMatcher makeIteratorLoopMatcher();
 ast_matchers::StatementMatcher makePseudoArrayLoopMatcher();
+
 } //namespace loop_migrate
 } //namespace clang
 
-#endif //_LLVM_TOOLS_CLANG_TOOLS_LOOP_CONVERT_LOOP_MATCHERS_H_
+#endif //_LLVM_TOOLS_CLANG_TOOLS_EXTRA_LOOP_CONVERT_LOOP_MATCHERS_H_

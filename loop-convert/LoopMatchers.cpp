@@ -1,3 +1,16 @@
+//===-- loop-convert/LoopMatchers.h - Matchers for for loops ----*- C++ -*-===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file contains definitions of the matchers for use in migrating
+// C++ for loops.
+//
+//===----------------------------------------------------------------------===//
 #include "LoopMatchers.h"
 
 namespace clang {
@@ -13,7 +26,20 @@ const char EndCallName[] = "endCall";
 const char ConditionEndVarName[] = "conditionEndVar";
 const char EndVarName[] = "endVar";
 
+// shared matchers
 static const TypeMatcher AnyType = anything();
+
+static const StatementMatcher IntegerComparisonMatcher =
+    expr(ignoringParenImpCasts(declRefExpr(to(
+        varDecl(hasType(isInteger())).bind(ConditionVarName)))));
+
+static const DeclarationMatcher InitToZeroMatcher =
+    varDecl(hasInitializer(ignoringParenImpCasts(
+        integerLiteral(equals(0))))).bind(InitVarName);
+
+static const StatementMatcher IncrementVarMatcher =
+    declRefExpr(to(
+        varDecl(hasType(isInteger())).bind(IncrementVarName)));
 
 // FIXME: How best to document complicated matcher expressions? They're fairly
 // self-documenting...but there may be some unintuitive parts.
@@ -21,7 +47,9 @@ static const TypeMatcher AnyType = anything();
 /// \brief The matcher for loops over arrays.
 ///
 /// In this general example, assuming 'j' and 'k' are of integral type:
+/// \code
 ///   for (int i = 0; j < 3 + 2; ++k) { ... }
+/// \endcode
 /// The following string identifers are bound to the parts of the AST:
 ///   ConditionVarName: 'j' (as a VarDecl)
 ///   ConditionBoundName: '3 + 2' (as an Expr)
@@ -35,25 +63,20 @@ static const TypeMatcher AnyType = anything();
 ///   - The index variable is only used as an array index.
 ///   - All arrays indexed by the loop are the same.
 StatementMatcher makeArrayLoopMatcher() {
-  StatementMatcher ArrayComparisonMatcher =
-      expression(ignoringParenImpCasts(declarationReference(to(
-          variable(hasType(isInteger())).bind(ConditionVarName)))));
   StatementMatcher ArrayBoundMatcher =
-      expression(hasType(isInteger())).bind(ConditionBoundName);
+      expr(hasType(isInteger())).bind(ConditionBoundName);
 
-  return id(LoopName, forStmt(
-      hasLoopInit(declarationStatement(hasSingleDecl(id(InitVarName, variable(
-          hasInitializer(ignoringParenImpCasts(integerLiteral(equals(0))))))))),
+  return forStmt(
+      hasLoopInit(declStmt(hasSingleDecl(InitToZeroMatcher))),
       hasCondition(anyOf(binaryOperator(hasOperatorName("<"),
-                                        hasLHS(ArrayComparisonMatcher),
+                                        hasLHS(IntegerComparisonMatcher),
                                         hasRHS(ArrayBoundMatcher)),
                          binaryOperator(hasOperatorName(">"),
                                         hasLHS(ArrayBoundMatcher),
-                                        hasRHS(ArrayComparisonMatcher)))),
-      hasIncrement(unaryOperator(
-          hasOperatorName("++"),
-          hasUnaryOperand(declarationReference(to(
-              variable(hasType(isInteger())).bind(IncrementVarName))))))));
+                                        hasRHS(IntegerComparisonMatcher)))),
+      hasIncrement(unaryOperator(hasOperatorName("++"),
+                                 hasUnaryOperand(IncrementVarMatcher))))
+      .bind(LoopName);
 }
 
 /// \brief The matcher used for iterator-based for loops.
@@ -63,10 +86,12 @@ StatementMatcher makeArrayLoopMatcher() {
 /// iterator type is actually a pointer type or a class type):
 ///
 /// Assuming f, g, and h are of type containerType::iterator,
+/// \code
 ///   for (containerType::iterator it = container.begin(),
 ///        e = createIterator(); f != g; ++h) { ... }
 ///   for (containerType::iterator it = container.begin();
 ///        f != anotherContainer.end(); ++h) { ... }
+/// \endcode
 /// The following string identifiers are bound to the parts of the AST:
 ///   InitVarName: 'it' (as a VarDecl)
 ///   ConditionVarName: 'f' (as a VarDecl)
@@ -83,59 +108,59 @@ StatementMatcher makeArrayLoopMatcher() {
 ///   - If the end iterator variable 'g' is defined, it is the same as 'f'
 StatementMatcher makeIteratorLoopMatcher() {
   StatementMatcher BeginCallMatcher =
-      memberCall(argumentCountIs(0), callee(method(hasName("begin"))));
+      memberCallExpr(argumentCountIs(0), callee(methodDecl(hasName("begin"))));
 
   DeclarationMatcher InitDeclMatcher =
-      variable(hasInitializer(anything())).bind(InitVarName);
+      varDecl(hasInitializer(anything())).bind(InitVarName);
 
   DeclarationMatcher EndDeclMatcher =
-      variable(hasInitializer(anything())).bind(EndVarName);
+      varDecl(hasInitializer(anything())).bind(EndVarName);
 
   StatementMatcher EndCallMatcher =
-      memberCall(argumentCountIs(0), callee(method(hasName("end"))));
+      memberCallExpr(argumentCountIs(0), callee(methodDecl(hasName("end"))));
 
   StatementMatcher IteratorBoundMatcher =
-      expression(anyOf(ignoringParenImpCasts(declarationReference(to(
-          variable().bind(ConditionEndVarName)))),
-                       ignoringParenImpCasts(
-                           expression(EndCallMatcher).bind(EndCallName)),
-                       materializeTempExpr(
-                           ignoringParenImpCasts(
-                               expression(EndCallMatcher).bind(EndCallName)))));
+      expr(anyOf(ignoringParenImpCasts(declRefExpr(to(
+          varDecl().bind(ConditionEndVarName)))),
+                 ignoringParenImpCasts(
+                     expr(EndCallMatcher).bind(EndCallName)),
+                 materializeTemporaryExpr(ignoringParenImpCasts(
+                     expr(EndCallMatcher).bind(EndCallName)))));
 
   StatementMatcher IteratorComparisonMatcher =
-      expression(ignoringParenImpCasts(declarationReference(to(
-          variable().bind(ConditionVarName)))));
+      expr(ignoringParenImpCasts(declRefExpr(to(
+          varDecl().bind(ConditionVarName)))));
 
-  StatementMatcher OverloadedNEQMatcher = overloadedOperatorCall(
+  StatementMatcher OverloadedNEQMatcher = operatorCallExpr(
       hasOverloadedOperatorName("!="),
       argumentCountIs(2),
       hasArgument(0, IteratorComparisonMatcher),
       hasArgument(1, IteratorBoundMatcher));
 
-  return id(LoopName, forStmt(
-            hasLoopInit(anyOf(
-                declarationStatement(declCountIs(2),
-                                     containsDeclaration(0, InitDeclMatcher),
-                                     containsDeclaration(1, EndDeclMatcher)),
-                declarationStatement(hasSingleDecl(InitDeclMatcher)))),
-            hasCondition(anyOf(
-                binaryOperator(hasOperatorName("!="),
-                               hasLHS(IteratorComparisonMatcher),
-                               hasRHS(IteratorBoundMatcher)),
-                binaryOperator(hasOperatorName("!="),
-                               hasLHS(IteratorBoundMatcher),
-                               hasRHS(IteratorComparisonMatcher)),
-                OverloadedNEQMatcher)),
-            hasIncrement(anyOf(
-                unaryOperator(hasOperatorName("++"),
-                              hasUnaryOperand(declarationReference(to(
-                                  variable(hasType(pointsTo(AnyType)))
-                                     .bind(IncrementVarName))))),
-                overloadedOperatorCall(
-                    hasOverloadedOperatorName("++"),
-                    hasArgument(0, declarationReference(to(
-                        variable().bind(IncrementVarName)))))))));
+  return forStmt(
+      hasLoopInit(anyOf(
+          declStmt(declCountIs(2),
+                   containsDeclaration(0, InitDeclMatcher),
+                   containsDeclaration(1, EndDeclMatcher)),
+          declStmt(hasSingleDecl(InitDeclMatcher)))),
+      hasCondition(anyOf(
+          binaryOperator(hasOperatorName("!="),
+                         hasLHS(IteratorComparisonMatcher),
+                         hasRHS(IteratorBoundMatcher)),
+          binaryOperator(hasOperatorName("!="),
+                         hasLHS(IteratorBoundMatcher),
+                         hasRHS(IteratorComparisonMatcher)),
+          OverloadedNEQMatcher)),
+      hasIncrement(anyOf(
+          unaryOperator(hasOperatorName("++"),
+                        hasUnaryOperand(declRefExpr(to(
+                            varDecl(hasType(pointsTo(AnyType)))
+                            .bind(IncrementVarName))))),
+          operatorCallExpr(
+              hasOverloadedOperatorName("++"),
+              hasArgument(0, declRefExpr(to(
+                  varDecl().bind(IncrementVarName))))))))
+                  .bind(LoopName);
 }
 
 /// \brief The matcher used for array-like containers (pseudoarrays).
@@ -145,8 +170,10 @@ StatementMatcher makeIteratorLoopMatcher() {
 /// iterator type is actually a pointer type or a class type):
 ///
 /// Assuming f, g, and h are of type containerType::iterator,
+/// \code
 ///   for (int i = 0, j = container.size(); f < g; ++h) { ... }
 ///   for (int i = 0; f < container.size(); ++h) { ... }
+/// \endcode
 /// The following string identifiers are bound to the parts of the AST:
 ///   InitVarName: 'i' (as a VarDecl)
 ///   ConditionVarName: 'f' (as a VarDecl)
@@ -165,49 +192,43 @@ StatementMatcher makeIteratorLoopMatcher() {
 ///   - If the end iterator variable 'g' is defined, it is the same as 'j'
 ///   - The container's iterators would not be invalidated during the loop
 StatementMatcher makePseudoArrayLoopMatcher() {
-  DeclarationMatcher InitDeclMatcher =
-         variable(hasInitializer(ignoringParenImpCasts(
-             integerLiteral(equals(0))))).bind(InitVarName);
   StatementMatcher SizeCallMatcher =
-      memberCall(argumentCountIs(0), callee(method(anyOf(hasName("size"),
-                                                         hasName("length")))));
+      memberCallExpr(argumentCountIs(0),
+                     callee(methodDecl(anyOf(hasName("size"),
+                                             hasName("length")))));
 
   StatementMatcher EndInitMatcher =
-      expression(anyOf(
-          ignoringParenImpCasts(expression(SizeCallMatcher).bind(EndCallName)),
-          explicitCast(hasSourceExpression(ignoringParenImpCasts(
-              expression(SizeCallMatcher).bind(EndCallName))))));
+      expr(anyOf(
+          ignoringParenImpCasts(expr(SizeCallMatcher).bind(EndCallName)),
+          explicitCastExpr(hasSourceExpression(ignoringParenImpCasts(
+              expr(SizeCallMatcher).bind(EndCallName))))));
 
   DeclarationMatcher EndDeclMatcher =
-       variable(hasInitializer(EndInitMatcher)).bind(EndVarName);
+      varDecl(hasInitializer(EndInitMatcher)).bind(EndVarName);
 
-  StatementMatcher IntegerComparisonMatcher =
-      expression(ignoringParenImpCasts(declarationReference(to(
-          variable(hasType(isInteger())).bind(ConditionVarName)))));
-
-  StatementMatcher ArrayBoundMatcher =
-      expression(anyOf(
-          ignoringParenImpCasts(declarationReference(to(
-              variable(hasType(isInteger())).bind(ConditionEndVarName)))),
+  StatementMatcher IndexBoundMatcher =
+      expr(anyOf(
+          ignoringParenImpCasts(declRefExpr(to(
+              varDecl(hasType(isInteger())).bind(ConditionEndVarName)))),
           EndInitMatcher));
 
-  return id(LoopName, forStmt(
+  return forStmt(
       hasLoopInit(anyOf(
-          declarationStatement(declCountIs(2),
-                               containsDeclaration(0, InitDeclMatcher),
-                               containsDeclaration(1, EndDeclMatcher)),
-          declarationStatement(hasSingleDecl(InitDeclMatcher)))),
+          declStmt(declCountIs(2),
+                   containsDeclaration(0, InitToZeroMatcher),
+                   containsDeclaration(1, EndDeclMatcher)),
+          declStmt(hasSingleDecl(InitToZeroMatcher)))),
       hasCondition(anyOf(
           binaryOperator(hasOperatorName("<"),
                          hasLHS(IntegerComparisonMatcher),
-                         hasRHS(ArrayBoundMatcher)),
+                         hasRHS(IndexBoundMatcher)),
           binaryOperator(hasOperatorName(">"),
-                         hasLHS(ArrayBoundMatcher),
+                         hasLHS(IndexBoundMatcher),
                          hasRHS(IntegerComparisonMatcher)))),
       hasIncrement(unaryOperator(
           hasOperatorName("++"),
-          hasUnaryOperand(declarationReference(to(
-              variable(hasType(isInteger())).bind(IncrementVarName))))))));
+          hasUnaryOperand(IncrementVarMatcher))))
+      .bind(LoopName);
 }
 
 } // namespace loop_migrate

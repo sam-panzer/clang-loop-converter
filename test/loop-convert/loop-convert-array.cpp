@@ -8,15 +8,17 @@
 // RUN:         && FileCheck -check-prefix=COUNTONLY -input-file=%T/out %s \
 // RUN:         && diff %t.cpp %t.base
 
+#include "structures.h"
+
 const int N = 6;
 const int NMinusOne = N - 1;
 int arr[N] = {1, 2, 3, 4, 5, 6};
 int (*pArr)[N] = &arr;
-#include "structures.h"
+
 void f() {
   int sum = 0;
   // Update the number of correctly converted loops as this test changes:
-  // COUNTONLY: 14 converted
+  // COUNTONLY: 15 converted
   // COUNTONLY-NEXT: 0 potentially conflicting
   // COUNTONLY-NEXT: 0 change(s) rejected
 
@@ -133,3 +135,22 @@ struct HasArr {
     // CHECK-NEXT: }
   }
 };
+
+// Loops whose bounds are value-dependent shold not be converted.
+template<int N>
+void dependentExprBound() {
+  for (int i = 0; i < N; ++i)
+    arr[i] = 0;
+  // CHECK: for (int i = 0; i < N; ++i)
+  // CHECK-NEXT: arr[i] = 0;
+}
+template void dependentExprBound<20>();
+
+void memberFunctionPointer() {
+  Val v;
+  void (Val::*mfpArr[N])(void) = { &Val::g };
+  for (int i = 0; i < N; ++i)
+    (v.*mfpArr[i])();
+  // CHECK: for (auto & [[VAR:[a-z_]+]] : mfpArr)
+  // CHECK-NEXT: (v.*[[VAR]])();
+}

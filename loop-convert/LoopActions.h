@@ -10,8 +10,8 @@
 // This file declares matchers and callbacks for use in migrating C++ for loops.
 //
 //===----------------------------------------------------------------------===//
-#ifndef _LLVM_TOOLS_CLANG_TOOLS_LOOP_CONVERT_LOOPACTIONS_H_
-#define _LLVM_TOOLS_CLANG_TOOLS_LOOP_CONVERT_LOOPACTIONS_H_
+#ifndef _LLVM_TOOLS_CLANG_TOOLS_EXTRA_LOOP_CONVERT_LOOPACTIONS_H_
+#define _LLVM_TOOLS_CLANG_TOOLS_EXTRA_LOOP_CONVERT_LOOPACTIONS_H_
 
 #include "StmtAncestor.h"
 #include "clang/Tooling/Refactoring.h"
@@ -23,6 +23,7 @@ namespace clang {
 namespace loop_migrate {
 
 struct Usage;
+class Confidence;
 // The main computational result of ForLoopIndexUseVisitor.
 typedef llvm::SmallVector<Usage, 8> UsageResult;
 
@@ -75,13 +76,33 @@ class LoopFixer : public ast_matchers::MatchFinder::MatchCallback {
   /// \brief Computes the changes needed to convert a given for loop, and
   /// applies it if this->CountOnly is false.
   void doConversion(ASTContext *Context,
-                    const VarDecl *IndexVar, const VarDecl *EndVar,
-                    const Expr *ContainerExpr, const UsageResult &Usages,
+                    const VarDecl *IndexVar,
+                    const VarDecl *MaybeContainer,
+                    StringRef ContainerString,
+                    const UsageResult &Usages,
                     const DeclStmt *AliasDecl, const ForStmt *TheLoop,
                     bool ContainerNeedsDereference);
 
+  /// \brief Given a loop header that would be convertible, discover all usages
+  /// of the index variable and convert the loop if possible.
+  void findAndVerifyUsages(ASTContext *Context,
+                           const VarDecl *LoopVar,
+                           const VarDecl *EndVar,
+                           const Expr *ContainerExpr,
+                           const Expr *BoundExpr,
+                           bool ContainerNeedsDereference,
+                           const ForStmt *TheLoop,
+                           Confidence ConfidenceLevel);
+
+  /// \brief Determine if the change should be deferred or rejected, returning
+  /// text which refers to the container iterated over if the change should
+  /// proceed.
+  StringRef checkDeferralsAndRejections(ASTContext *Context,
+                                        const Expr *ContainerExpr,
+                                        Confidence ConfidenceLevel,
+                                        const ForStmt *TheLoop);
 };
 
 } // namespace loop_migrate
 } // namespace clang
-#endif  // _LLVM_TOOLS_CLANG_TOOLS_LOOP_CONVERT_LOOPACTIONS_H_
+#endif  // _LLVM_TOOLS_CLANG_TOOLS_EXTRA_LOOP_CONVERT_LOOPACTIONS_H_
